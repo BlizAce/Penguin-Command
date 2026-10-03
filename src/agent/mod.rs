@@ -18,6 +18,8 @@ pub enum AgentEvent {
     TextDone,
     ToolStarted { id: String, name: String, args: String },
     ToolFinished { id: String, ok: bool, output: String },
+    /// The agent modified a file — the UI renders this unified diff inline.
+    Diff { path: String, added: usize, removed: usize, text: String },
     Plan(Vec<(String, String)>),
     NeedPermission { title: String, detail: String, rule_key: String, tx: Sender<Outcome> },
     /// A child command is waiting for a password: the UI must prompt (hidden)
@@ -64,6 +66,10 @@ pub struct AgentEnv {
     /// YOLO mode: safety-gate Ask verdicts are auto-approved (hard-blocks and
     /// sudo password prompts remain). Toggled live with /yolo or --yolo.
     pub yolo: bool,
+    /// Unlimited run: ignore max_iterations/goal_continuation caps so goals
+    /// keep going until verified or aborted. Toggled live with /limit; the
+    /// flag is re-read every iteration, so it also works mid-turn.
+    pub unlimited_run: bool,
 }
 
 #[allow(dead_code)]
@@ -115,7 +121,16 @@ fn system_prompt(env: &AgentEnv) -> String {
     )
 }
 
-pub fn spawn_agent(env: Arc<Mutex<AgentEnv>>, cfg: Config) -> (AgentHandle, Receiver<AgentEvent>) {
+/// User instructions typed while the agent is mid-run. The UI pushes into it;
+/// run_turn drains it at iteration boundaries and injects each item as a live
+/// user interjection, so the agent adapts without stopping its current work.
+pub type InstructionQueue = Arc<Mutex<Vec<String>>>;
+
+pub fn spawn_agent(
+    env: Arc<Mutex<AgentEnv>>,
+    cfg: Config,
+    queue: InstructionQueue,
+) -> (AgentHandle, Receiver<AgentEvent>) {
     let (ev_tx, ev_rx) = channel::<AgentEvent>();
     let (cmd_tx, cmd_rx) = channel::<AgentCommand>();
     let abort = Arc::new(AtomicBool::new(false));
@@ -125,7 +140,7 @@ pub fn spawn_agent(env: Arc<Mutex<AgentEnv>>, cfg: Config) -> (AgentHandle, Rece
     std::thread::spawn(move || {
         let mut messages: Vec<ChatMsg> = Vec::new();
         let mut goal_state: Option<GoalState> = None;
-        agent_thread(env, cfg, cmd_rx, ev_tx, abort, busy, &mut messages, &mut goal_state);
+        agent_thread(env, cfg, queue, cmd_rx, ev_tx, abort, busy, &mut messages, &mut goal_state);
     });
     (handle, ev_rx)
 }
@@ -242,6 +257,55 @@ fn compact_messages(
     true
 }
 
+/// True when a provider error means "your prompt doesn't fit the context
+/// window" (OpenAI/vLLM/Ollama/llama.cpp/Anthropic phrasings). Such errors
+/// are recoverable by compacting, unlike real request failures.
+fn is_context_overflow(err: &str) -> bool {
+    let e = err.to_lowercase();
+    [
+        "maximum context",
+        "context length",
+        "context_length",
+        "context window",
+        "prompt is too long",
+        "too many tokens",
+        "reduce your prompt",
+        "input length",
+        "n_ctx",
+        "exceeds model",
+        "exceed the model",
+        "token limit exceeded",
+    ]
+    .iter()
+    .any(|p| e.contains(p))
+}
+
+/// Compaction triggered by a provider-side context-overflow rejection.
+/// First pass is the normal summarize+elide; `hard` adds last-resort
+/// truncation of every remaining oversized message so the retry fits even
+/// when there's nothing left to summarize away. Never removes messages, so
+/// tool-call pairing survives.
+fn force_compact(
+    provider: &Provider,
+    model: &str,
+    messages: &mut Vec<ChatMsg>,
+    ev_tx: &Sender<AgentEvent>,
+    abort: &AtomicBool,
+    rcfg: &RequestCfg,
+    hard: bool,
+) {
+    compact_messages(provider, model, messages, ev_tx, abort, rcfg);
+    trim_old_tools(messages, if hard { 2 } else { 6 });
+    if hard {
+        for m in messages.iter_mut().skip(1) {
+            let cap = if m.role == Role::Tool { 600 } else { 4000 };
+            if m.text.chars().count() > cap * 2 {
+                m.text = tools::middle_truncate(&m.text, cap);
+            }
+        }
+    }
+}
+
 fn save_session(env: &AgentEnv, messages: &[ChatMsg], goal: &Option<GoalState>) {
     let kept: Vec<ChatMsg> = messages.iter().filter(|m| m.role != Role::System).cloned().collect();
     if kept.is_empty() {
@@ -254,6 +318,7 @@ fn save_session(env: &AgentEnv, messages: &[ChatMsg], goal: &Option<GoalState>) 
 fn agent_thread(
     env: Arc<Mutex<AgentEnv>>,
     mut cfg: Config,
+    queue: InstructionQueue,
     cmd_rx: Receiver<AgentCommand>,
     ev_tx: Sender<AgentEvent>,
     abort: Arc<AtomicBool>,
@@ -304,6 +369,7 @@ fn agent_thread(
             AgentCommand::Prompt { text, goal } => run_turn(
                 &env,
                 &mut cfg,
+                &queue,
                 messages,
                 goal_state,
                 &ev_tx,
@@ -315,6 +381,7 @@ fn agent_thread(
             AgentCommand::ContinueGoal { note } => run_turn(
                 &env,
                 &mut cfg,
+                &queue,
                 messages,
                 goal_state,
                 &ev_tx,
@@ -336,6 +403,7 @@ const CONTINUE_NUDGE: &str = "Continue working toward the GOAL now. Take the nex
 fn run_turn(
     env: &Arc<Mutex<AgentEnv>>,
     cfg: &mut Config,
+    queue: &InstructionQueue,
     messages: &mut Vec<ChatMsg>,
     goal_state: &mut Option<GoalState>,
     ev_tx: &Sender<AgentEvent>,
@@ -416,11 +484,33 @@ fn run_turn(
     // (reasoning streamed but no answer); drives the escalating
     // auto-recovery below before finally giving up.
     let mut starve_streak = 0usize;
+    // Forced compactions already burned recovering from provider-side
+    // context-overflow rejections this turn (reset on each success).
+    let mut forced_compacts = 0usize;
 
     loop {
-        for _iter in 0..max_iter {
+        let mut iter = 0usize;
+        loop {
             if abort.load(Ordering::Relaxed) {
                 break;
+            }
+            // /limit off is re-read every step so it takes effect mid-run.
+            if iter >= max_iter && !env.lock().unwrap().unlimited_run {
+                break;
+            }
+            iter += 1;
+            // Mid-run instructions the user queued while we were working:
+            // injected at this request-shaped boundary, never mid tool batch.
+            let pending: Vec<String> = std::mem::take(&mut *queue.lock().unwrap());
+            for instr in pending {
+                let _ = ev_tx.send(AgentEvent::Info(format!(
+                    "📨 queued instruction delivered · {}",
+                    providers::truncate(&instr, 80)
+                )));
+                push_user(
+                    messages,
+                    &format!("[New instruction from the user — incorporate it into your current work]\n{instr}"),
+                );
             }
             let est = estimate_tokens(messages);
             let _ = ev_tx.send(AgentEvent::Context { used: est, window });
@@ -449,6 +539,7 @@ fn run_turn(
             };
             match providers::chat(&provider, &model, messages, &specs, &rcfg, &mut ctx) {
                 Ok(resp) => {
+                    forced_compacts = 0;
                     let _ = ev_tx.send(AgentEvent::TextDone);
                     let totally_empty = resp.text.trim().is_empty()
                         && resp.tool_calls.is_empty()
@@ -517,11 +608,16 @@ fn run_turn(
                     if resp.tool_calls.is_empty() {
                         if resp.truncated && !abort.load(Ordering::Relaxed) {
                             // answer cut off mid-sentence: let it
-                            // continue once before giving up
-                            messages.push(ChatMsg::user(
-                                "Your reply was cut off at the token limit. Continue exactly where \
-                                 you left off, in smaller pieces.".to_string(),
-                            ));
+                            // continue once before giving up. When the
+                            // truncation already dropped tool calls, the
+                            // retry note above covers it — stacking a second
+                            // nudge just confuses the model.
+                            if resp.dropped_tools.is_empty() {
+                                messages.push(ChatMsg::user(
+                                    "Your reply was cut off at the token limit. Continue exactly where \
+                                     you left off, in smaller pieces.".to_string(),
+                                ));
+                            }
                             continue;
                         }
                         break;
@@ -577,6 +673,22 @@ fn run_turn(
                                 });
                                 messages.push(ChatMsg::tool_result(&call.id, text));
                             }
+                            Some(ToolOutcome::FileChange { result, path, diff }) => {
+                                let _ = ev_tx.send(AgentEvent::ToolFinished {
+                                    id: call.id.clone(),
+                                    ok: true,
+                                    output: result.clone(),
+                                });
+                                if let Some(d) = diff {
+                                    let _ = ev_tx.send(AgentEvent::Diff {
+                                        path,
+                                        added: d.added,
+                                        removed: d.removed,
+                                        text: d.text,
+                                    });
+                                }
+                                messages.push(ChatMsg::tool_result(&call.id, result));
+                            }
                             Some(ToolOutcome::Plan(steps)) => {
                                 let _ = ev_tx.send(AgentEvent::ToolFinished {
                                     id: call.id.clone(),
@@ -618,7 +730,21 @@ fn run_turn(
                     }
                 }
                 Err(e) => {
-                    turn_err = Some(format!("{e}"));
+                    let es = e.to_string();
+                    // Provider rejected the prompt as too long: compact hard
+                    // and retry instead of killing the turn. Escalate on the
+                    // second attempt; a third rejection is fatal.
+                    if is_context_overflow(&es) && forced_compacts < 2 && !abort.load(Ordering::Relaxed) {
+                        forced_compacts += 1;
+                        let _ = ev_tx.send(AgentEvent::Info(format!(
+                            "⊂ provider hit the context limit — forcing compaction ({forced_compacts}/2) and continuing"
+                        )));
+                        force_compact(&provider, &model, messages, ev_tx, abort, &rcfg, forced_compacts >= 2);
+                        save_session(&env_guard, messages, goal_state);
+                        let _ = ev_tx.send(AgentEvent::Context { used: estimate_tokens(messages), window });
+                        continue;
+                    }
+                    turn_err = Some(es);
                     break;
                 }
             }
@@ -629,13 +755,16 @@ fn run_turn(
         if !goal_open || turn_err.is_some() || abort.load(Ordering::Relaxed) {
             break;
         }
-        if continuations >= max_cont {
+        if continuations >= max_cont && !env.lock().unwrap().unlimited_run {
             break;
         }
         continuations += 1;
-        let _ = ev_tx.send(AgentEvent::Info(format!(
-            "↻ goal not verified yet — auto-continuing ({continuations}/{max_cont})"
-        )));
+        let label = if env.lock().unwrap().unlimited_run {
+            format!("↻ goal not verified yet — auto-continuing (#{continuations}, unlimited — /limit on to cap, esc to stop)")
+        } else {
+            format!("↻ goal not verified yet — auto-continuing ({continuations}/{max_cont})")
+        };
+        let _ = ev_tx.send(AgentEvent::Info(label));
         push_user(messages, CONTINUE_NUDGE);
     }
     if goal_open && turn_err.is_none() {
@@ -766,7 +895,46 @@ mod tests {
             session_id: "test".into(),
             reasoning_effort: None,
             yolo,
+            unlimited_run: false,
         }
+    }
+
+    #[test]
+    fn context_overflow_detected_across_providers() {
+        assert!(is_context_overflow(
+            "HTTP 400 Bad Request: {\"error\":{\"message\":\"This model's maximum context length is 8192 tokens…\"}}"
+        ));
+        assert!(is_context_overflow("HTTP 400: prompt is too long: 210000 tokens > 200000 maximum"));
+        assert!(is_context_overflow("context length exceeded input_tokens"));
+        assert!(is_context_overflow("llama_cpp_server: (n_ctx: 4096) the request exceeds the context"));
+        // unrelated failures must not trigger compaction loops
+        assert!(!is_context_overflow("HTTP 503 Service Unavailable: model is loading"));
+        assert!(!is_context_overflow("timed out waiting for first byte after 600s"));
+    }
+
+    #[test]
+    fn force_compact_truncates_oversized_messages_in_hard_mode() {
+        let (ev_tx, _rx) = channel::<AgentEvent>();
+        let provider = Provider {
+            name: "t".into(),
+            kind: crate::config::ProviderKind::Openai,
+            base_url: "http://localhost".into(),
+            api_key: String::new(),
+            models: vec![],
+            default_model: None,
+            context_window: Some(4096),
+        };
+        let rcfg = RequestCfg::from_agent(&Config::default().agent);
+        // Too few messages for the summarizer path → hard truncation must
+        // still shrink the giant tool result so a retry can fit.
+        let mut msgs = vec![
+            ChatMsg::system("sys"),
+            ChatMsg::user("go"),
+            ChatMsg::tool_result("c1", &"x".repeat(50_000)),
+        ];
+        force_compact(&provider, "m", &mut msgs, &ev_tx, &AtomicBool::new(false), &rcfg, true);
+        assert!(msgs[2].text.chars().count() < 1000);
+        assert_eq!(msgs.len(), 3, "pairing preserved — nothing dropped");
     }
 
     #[test]

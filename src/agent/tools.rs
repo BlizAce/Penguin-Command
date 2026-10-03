@@ -138,6 +138,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 pub enum ToolOutcome {
     /// Result text fed back to the model.
     Feed(String),
+    /// A file was modified: result text for the model plus a unified diff
+    /// (None when unchanged or too large) that the UI renders automatically.
+    FileChange { result: String, path: String, diff: Option<crate::diff::FileDiff> },
     /// update_plan payload: Vec<(label,status)>
     Plan(Vec<(String, String)>),
     /// finish_goal called
@@ -484,11 +487,18 @@ pub fn execute(
         }
         "write_file" => {
             let path = crate::safety::resolve(workspace, args["path"].as_str().unwrap_or(""));
+            let content = args["content"].as_str().unwrap_or("");
+            // Snapshot the previous bytes so the UI can show what changed.
+            let before = std::fs::read_to_string(&path).unwrap_or_default();
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(&path, args["content"].as_str().unwrap_or(""))?;
-            Ok(ToolOutcome::Feed(format!("wrote {} bytes to {}", args["content"].as_str().unwrap_or("").len(), path.display())))
+            std::fs::write(&path, content)?;
+            Ok(ToolOutcome::FileChange {
+                result: format!("wrote {} bytes to {}", content.len(), path.display()),
+                path: path.display().to_string(),
+                diff: crate::diff::unified_diff(&before, content, 3),
+            })
         }
         "edit_file" => {
             let path = crate::safety::resolve(workspace, args["path"].as_str().unwrap_or(""));
@@ -502,8 +512,13 @@ pub fn execute(
             if count > 1 {
                 return Ok(ToolOutcome::Feed(format!("edit failed: old_string matches {count} times; make it unique.")));
             }
-            std::fs::write(&path, content.replacen(old, new, 1))?;
-            Ok(ToolOutcome::Feed(format!("edited {}", path.display())))
+            let updated = content.replacen(old, new, 1);
+            std::fs::write(&path, &updated)?;
+            Ok(ToolOutcome::FileChange {
+                result: format!("edited {}", path.display()),
+                path: path.display().to_string(),
+                diff: crate::diff::unified_diff(&content, &updated, 3),
+            })
         }
         "list_dir" => {
             let path = crate::safety::resolve(workspace, args["path"].as_str().unwrap_or("."));

@@ -48,11 +48,12 @@ Press `t` on a provider to **ping the default model**: penguin measures time-to-
 - **Easy provider setup** — a TUI wizard (`pc setup` or `/providers`): add OpenAI-compatible endpoints (OpenAI, Ollama, LM Studio, OpenRouter, llama.cpp, vLLM, anything) or Anthropic. Name each provider as you create it, test the connection, fetch the model list, ping for latency, pick your default, and set the context window (`ctx`) used for usage tracking. Names are validated unique. Editing `config.toml` by hand still works.
 - **System-assistant tools** — run commands, read/write/edit files (anywhere it may read; writes are guarded), find/grep, list dirs, chmod/chown. Coding and project builds work too via the same tools.
 - **YOLO mode** — `pc --yolo` or `/yolo` auto-approves every action the safety gate would prompt for (sudo, writes outside the workspace, `curl | sh`). Catastrophic hard-blocks (`rm -rf /`, raw disk writes, fork bombs…) and interactive sudo password prompts always remain. A red `⚠ YOLO` badge stays in the status bar while it's on.
-- **Goals sidebar** — `/goal <thing>` gives the agent autonomy. A panel on the right of the screen shows the active goal and its steps ("minor goals") with live status — ○ pending, ◐ running, ✓ done, ✗ failed — plus a ★ verified banner once the agent proves success with a real check. If the model stops before verifying, penguin **auto-continues** it (up to `agent.goal_continuations` rounds); when even that runs dry, `/continue [guidance]` picks the goal back up **with its plan intact** — no replanning round-trip.
+- **Goals sidebar** — `/goal <thing>` gives the agent autonomy. A panel on the right of the screen shows the active goal and its steps ("minor goals") with live status — ○ pending, ◐ running, ✓ done, ✗ failed — plus a ★ verified banner once the agent proves success with a real check. If the model stops before verifying, penguin **auto-continues** it (up to `agent.goal_continuations` rounds); when even that runs dry, `/continue [guidance]` picks the goal back up **with its plan intact** — no replanning round-trip. Want it to simply never stop? **`/limit off`** lifts the iteration and continuation caps so a run keeps going until it verifies (or you hit `Esc`) — re-read every step, so it also works mid-run; a `∞ UNLIMITED` badge stays in the status bar while it's on, and `/limit on` restores the caps.
+- **Mid-run steering** — typing while the agent works used to mean "wait for the turn to end". Now anything you enter (`Enter`, or explicitly `/queue <text>`) is injected into the conversation **at the agent's next step**: it folds your extra instruction into its current work without stopping. `/queue` lists what's waiting, `/queue clear` drops it; whatever a turn never got to (e.g. after an abort) still flushes when it ends.
 - **Sessions** — every conversation is saved under `~/.config/penguin/sessions/`, checkpointed after *every* agent step so a crash or timeout loses at most one move. The active goal, its plan and its verified flag ride along: `/resume` (or `pc --continue`) restores the sidebar exactly as it was, and an unfinished goal can be resumed later with `/continue`. `/new` starts fresh, `/sessions` lists history.
 - **Skills that grow the system** — after finishing a goal the agent can distill what it learned into a reusable *skill* (`save_skill`) stored in `~/.config/penguin/skills/`. Skills are injected into every future session's system prompt; the agent loads and follows them with `load_skill` when one matches. `/skills` lists the library.
-- **Context meter & auto-compaction** — the status bar shows live context usage (`ctx 42%`) against the provider's window. At ~85% (configurable: `agent.compact_at_percent`) penguin summarizes older turns and elides stale tool output automatically, without breaking tool-call pairing. `/context` for details, `/compact` to force it.
-- **Never wonder what to press** — every screen carries visible key bars: mode-toggle hints in the status bar, a legend under the composer (`enter send · alt+enter newline · …`), slash-command autocomplete as you type `/`, and full key bars in the provider wizard.
+- **Context meter & auto-compaction** — the status bar shows live context usage (`ctx 42%`) against the provider's window. At ~85% (configurable: `agent.compact_at_percent`) penguin summarizes older turns and elides stale tool output automatically, without breaking tool-call pairing. If a provider still rejects a prompt as too long ("maximum context length…"), penguin **compacts hard and continues** the turn instead of dying on the error. `/context` for details, `/compact` to force it.
+- **Never wonder what to press** — every screen carries visible key bars: mode-toggle hints in the status bar, a legend under the composer (`enter send · alt+enter newline · …`), slash-command suggestions as you type `/` — and `Enter` on a partial command **completes and sends it** (ambiguous prefixes fill the common part so you can keep typing) — plus full key bars in the provider wizard.
 - **Idle penguin screensaver** — leave the terminal untouched for a few minutes and animated ASCII penguins take over: waddling through a blizzard, waving under a shimmering aurora, or belly-sliding across the ice, with a per-character shimmer title (à la the Omarchy screensaver). Any key wakes it instantly. Force it anytime with `/screensaver`; tune or disable via `ui.idle_secs`.
 - **Sudo that just works** — prefix a command with `sudo` and penguin rewrites it to read the password from a pipe, detects the `[sudo] password for …:` prompt on stderr, and pops a **hidden password modal**. Children are detached with `setsid` so nothing can steal your keystrokes or echo the secret. The agent is explicitly told never to ask you to paste a password into chat.
 - **Safety engine**
@@ -111,7 +112,8 @@ pc setup               configure providers (TUI wizard)
 | `Shift+PgUp/Dn` | scroll shell / transcript |
 | `Esc` (agent busy) | abort the current agent turn — mid-stream, mid-retry-wait or mid-compaction |
 | `Alt+Enter` | newline in composer |
-| `Enter` (agent busy) | queue the prompt — sent automatically when the turn ends |
+| `Enter` (typing `/cmd`) | complete a slash command and send it; ambiguous prefixes fill the common part |
+| `Enter` (agent busy) | queue the prompt — injected at the agent's next step |
 | `Up` / `Down` | composer prompt history |
 | `Tab` (agent mode) | expand/collapse full tool output |
 | `Ctrl+Q` | force-quit penguin |
@@ -123,6 +125,9 @@ pc setup               configure providers (TUI wizard)
 ```
 /goal <text>      autonomous mode: plan → execute → verify (auto-continues if stopped early)
 /continue [note]  resume the unfinished goal with its plan intact (+ optional guidance)
+/queue <text>     add an instruction handed to the agent at its next step mid-run
+                  (/queue lists the queue · /queue clear empties it · idle: runs now)
+/limit off|on     remove/restore run-length caps — off never pauses for /continue (Esc still stops)
 /new              start a fresh session
 /sessions         list saved sessions
 /resume [id]      resume a session (latest if no id)
@@ -164,6 +169,7 @@ context_window = 262144                      # drives ctx meter + auto-compactio
 [agent]
 max_iterations         = 40
 goal_continuations     = 2       # extra rounds if a goal stops before verifying
+unlimited_run          = false   # true (or /limit off) = no caps: runs until verified or Esc
 compact_at_percent     = 85      # auto-compact threshold
 auto_approve_workspace = true    # writes inside workspace don't prompt
 reasoning_effort       = "xhigh" # low | medium | high | xhigh | off

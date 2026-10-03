@@ -102,6 +102,10 @@ pub struct AgentConfig {
     /// Catastrophic hard-blocks (rm -rf /, raw disk writes, …) still apply,
     /// and sudo password prompts are still asked interactively.
     pub yolo: bool,
+    /// Unlimited run: ignore max_iterations and goal_continuations so a goal
+    /// keeps going until it verifies or the user hits Esc / `/limit on`.
+    /// Toggled live with /limit; Esc and safety gates still apply.
+    pub unlimited_run: bool,
 }
 
 /// Reasoning-effort levels penguin will forward to a provider.
@@ -141,8 +145,11 @@ impl AgentConfig {
     /// Completion ceiling. Allowed up to 1M so a model with a huge window can
     /// be told to use it; the actual value sent is clamped per request to the
     /// room left in the context window (see providers::completion_tokens).
+    /// Unset or 0 → 16384: thinking models need far more than a few hundred
+    /// tokens before they can answer, and a too-small default truncates every
+    /// tool call and starves every reply.
     pub fn max_tokens(&self) -> u32 {
-        self.max_tokens.unwrap_or(0).max(256).min(1_048_576)
+        self.max_tokens.filter(|n| *n > 0).unwrap_or(16_384).max(256).min(1_048_576)
     }
     /// Thinking-token cap to forward; 0 or None disables the field entirely.
     pub fn max_reasoning_tokens(&self) -> Option<u32> {
@@ -324,6 +331,20 @@ mod tests {
         let mut c = Config::default();
         c.agent.max_tokens = Some(250_000);
         assert_eq!(c.agent.max_tokens(), 250_000);
+    }
+
+    #[test]
+    fn max_tokens_defaults_to_16384() {
+        // Regression: an unset ceiling used to fall through to 256, which
+        // truncated every tool call and starved every thinking reply.
+        let c = Config::default();
+        assert_eq!(c.agent.max_tokens(), 16_384);
+        let mut c = Config::default();
+        c.agent.max_tokens = Some(0);
+        assert_eq!(c.agent.max_tokens(), 16_384);
+        // explicit small values stay clamped to a usable floor
+        c.agent.max_tokens = Some(10);
+        assert_eq!(c.agent.max_tokens(), 256);
     }
 
     #[test]

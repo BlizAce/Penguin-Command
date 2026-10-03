@@ -37,6 +37,8 @@ pub enum Entry {
     Info(String),
     Error(String),
     Goal { summary: String, evidence: String },
+    /// Unified diff of an agent file edit, rendered inline automatically.
+    Diff { path: String, added: usize, removed: usize, text: String },
 }
 
 pub struct PermModal {
@@ -106,8 +108,10 @@ pub struct App {
     pub recv_chars: usize,
     /// Last submitted prompt, for /retry after a failed turn.
     last_prompt: Option<(String, bool)>,
-    /// Prompts typed while the agent was busy; sent one-per-turn as it finishes.
-    pub queued: Vec<String>,
+    /// Instructions typed while the agent is mid-run. Shared with the agent
+    /// thread, which injects them at iteration boundaries; whatever is left
+    /// when a turn ends (aborts, plain chat) flushes one-per-turn from here.
+    pub queued: crate::agent::InstructionQueue,
     /// Tab toggles full tool output vs the compact preview.
     pub expand_tools: bool,
 }
@@ -175,6 +179,8 @@ impl App {
             "" => {}
             "help" => self.transcript.push(Entry::Info(
                 "/goal <text> autonomous plan+execute+verify · /continue [note] resume the unfinished goal · \
+                 /queue <text> add instructions mid-run (/queue lists, /queue clear) · \
+                 /limit off|on remove/restore run-length caps · \
                  /new fresh session · /sessions list · /resume [id] · /skills list saved skills · \
                  /compact compact context now · /retry resend last prompt · /effort cycle reasoning depth · \
                  /context usage · /yolo bypass approvals (dangerous) · /providers setup UI · /model [name] · \
@@ -197,6 +203,60 @@ impl App {
                 }
             }
             "continue" | "cont" => self.send_continue(rest.to_string()),
+            "queue" => {
+                if rest.eq_ignore_ascii_case("clear") {
+                    let n = self.queued.lock().unwrap().len();
+                    self.queued.lock().unwrap().clear();
+                    self.transcript.push(Entry::Info(format!("🗑 cleared {n} queued instruction(s)")));
+                } else if rest.is_empty() {
+                    let q = self.queued.lock().unwrap();
+                    if q.is_empty() {
+                        self.transcript.push(Entry::Info(
+                            "queue is empty — /queue <text> hands the agent an extra instruction mid-run".into(),
+                        ));
+                    } else {
+                        for (i, t) in q.iter().enumerate() {
+                            self.transcript.push(Entry::Info(format!("⏳ {}: {}", i + 1, crate::providers::truncate(t, 100))));
+                        }
+                        self.transcript.push(Entry::Info("/queue clear drops everything".into()));
+                    }
+                } else if self.busy {
+                    self.enqueue_instruction(rest.to_string());
+                } else {
+                    // Idle: nothing to wait for — run it right away.
+                    self.send_prompt(rest.to_string(), false);
+                }
+            }
+            "limit" => {
+                let next = match rest.to_lowercase().as_str() {
+                    "" | "toggle" => !self.env.lock().unwrap().unlimited_run,
+                    "off" | "unlimited" => true,
+                    "on" | "restore" => false,
+                    _ => {
+                        self.transcript.push(Entry::Error(
+                            "usage: /limit off|on — off lifts the iteration & continuation caps so runs \
+                             never pause for /continue (esc still stops)".into(),
+                        ));
+                        return Ok(());
+                    }
+                };
+                self.env.lock().unwrap().unlimited_run = next;
+                self.cfg.agent.unlimited_run = next;
+                let _ = self.cfg.save();
+                if next {
+                    self.transcript.push(Entry::Info(
+                        "⚡ UNLIMITED RUN — iteration & continuation caps lifted; goals auto-continue until \
+                         verified. A ∞ badge marks it in the status bar. Esc still stops, safety gates still \
+                         apply. /limit on to restore.".into(),
+                    ));
+                } else {
+                    self.transcript.push(Entry::Info(format!(
+                        "✦ run limits restored — max_iterations {}, goal continuations {}",
+                        self.cfg.agent.max_iterations.max(4),
+                        self.cfg.agent.goal_continuations
+                    )));
+                }
+            }
             "providers" | "provider" => self.setup_interactive()?,
             "new" => {
                 if self.busy {
@@ -214,7 +274,7 @@ impl App {
                 self.goal_verified = false;
                 self.ctx_used = 0;
                 self.streaming.clear();
-                self.queued.clear();
+                self.queued.lock().unwrap().clear();
                 self.transcript.push(Entry::Info(format!("✦ new session · {id}")));
             }
             "sessions" | "history" => {
@@ -386,7 +446,7 @@ impl App {
         self.env.lock().unwrap().session_id = s.id.clone();
         self.transcript.clear();
         self.streaming.clear();
-        self.queued.clear();
+        self.queued.lock().unwrap().clear();
         // Restore the goal + plan exactly as saved; sessions written before
         // those fields existed fall back to scanning for the GOAL header.
         match &s.goal {
@@ -501,6 +561,9 @@ impl App {
                         *slot = Some(short_output(&output));
                     }
                 }
+                AgentEvent::Diff { path, added, removed, text } => {
+                    self.transcript.push(Entry::Diff { path, added, removed, text });
+                }
                 AgentEvent::Plan(steps) => self.plan = steps,
                 AgentEvent::NeedPermission { title, detail, tx, .. } => {
                     self.permission = Some(PermModal { title, detail, tx, sel: 0 });
@@ -535,9 +598,13 @@ impl App {
                     }
                     // give a fresh idle window after the agent finishes working
                     self.last_input = std::time::Instant::now();
-                    // flush one queued prompt per finished turn
-                    if !self.queued.is_empty() {
-                        let next = self.queued.remove(0);
+                    // Anything still queued (typed after the agent's last
+                    // mid-run drain, or left by an abort) goes out now.
+                    let next = {
+                        let mut q = self.queued.lock().unwrap();
+                        if q.is_empty() { None } else { Some(q.remove(0)) }
+                    };
+                    if let Some(next) = next {
                         self.transcript.push(Entry::Info("⏳ sending queued prompt…".into()));
                         self.send_prompt(next, false);
                     }
@@ -625,6 +692,24 @@ impl App {
         if text.is_empty() {
             return Ok(());
         }
+        // Basic slash autocomplete: a unique prefix completes and sends; an
+        // ambiguous one fills the common prefix so typing can continue.
+        if let Some(comp) = render::complete_slash(&text) {
+            match comp {
+                render::SlashCompletion::Send(full) => {
+                    self.history.push(full.clone());
+                    self.hist_pos = self.history.len();
+                    self.composer.clear();
+                    self.comp_cur = 0;
+                    return self.handle_slash(&full);
+                }
+                render::SlashCompletion::Fill(prefix) => {
+                    self.composer = prefix;
+                    self.comp_cur = self.composer.chars().count();
+                    return Ok(());
+                }
+            }
+        }
         self.history.push(text.clone());
         self.hist_pos = self.history.len();
         self.composer.clear();
@@ -632,14 +717,29 @@ impl App {
         if text.starts_with('/') {
             self.handle_slash(&text)?;
         } else if self.busy {
-            // "enter queue" from the key legend: buffer it, send on Done.
-            self.queued.push(text);
-            let n = self.queued.len();
-            self.transcript.push(Entry::Info(format!("⏳ queued ({n}) — sends when the agent finishes")));
+            // "enter queue" from the key legend: the agent injects it at its
+            // next step; leftovers (abort, plain chat) flush on Done.
+            let n = {
+                let mut q = self.queued.lock().unwrap();
+                q.push(text);
+                q.len()
+            };
+            self.transcript.push(Entry::Info(format!("⏳ queued ({n}) — injected at the agent's next step")));
         } else {
             self.send_prompt(text, false);
         }
         Ok(())
+    }
+
+    fn enqueue_instruction(&mut self, text: String) {
+        let n = {
+            let mut q = self.queued.lock().unwrap();
+            q.push(text);
+            q.len()
+        };
+        self.transcript.push(Entry::Info(format!(
+            "⏳ queued ({n}) — injected at the agent's next step"
+        )));
     }
 }
 
@@ -715,8 +815,10 @@ pub fn run(opts: Options) -> Result<()> {
         session_id: session::new_id(),
         reasoning_effort: cfg.agent.reasoning_effort(),
         yolo: cfg.agent.yolo,
+        unlimited_run: cfg.agent.unlimited_run,
     }));
-    let (handle, agent_ev) = crate::agent::spawn_agent(env.clone(), cfg.clone());
+    let queue: crate::agent::InstructionQueue = Arc::new(Mutex::new(Vec::new()));
+    let (handle, agent_ev) = crate::agent::spawn_agent(env.clone(), cfg.clone(), queue.clone());
 
     let mut app = App {
         cfg: cfg.clone(),
@@ -758,7 +860,7 @@ pub fn run(opts: Options) -> Result<()> {
         first_token_at: None,
         recv_chars: 0,
         last_prompt: None,
-        queued: Vec::new(),
+        queued: queue,
         expand_tools: false,
     };
 

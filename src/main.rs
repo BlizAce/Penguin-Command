@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod config;
+mod diff;
 mod integration;
 mod penguin;
 mod providers;

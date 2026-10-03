@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, BorderType, Clear, List, ListItem, Paragraph},
     Frame,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn char_index(s: &str, n: usize) -> usize {
     s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
@@ -31,50 +32,125 @@ fn spinner(tick: u32) -> &'static str {
     FRAMES[((tick / 2) as usize) % FRAMES.len()]
 }
 
-/// Char-safe word wrap (byte slicing here once panicked on multibyte words).
+/// Make a line safe to render at a fixed column budget: expand tabs to the
+/// next 4-column stop, drop `\r`, blank other control characters.
+fn normalize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for c in s.chars() {
+        match c {
+            '\t' => {
+                let stop = 4 - (col % 4);
+                for _ in 0..stop {
+                    out.push(' ');
+                }
+                col += stop;
+            }
+            '\r' => {}
+            c if c.is_control() => out.push(' '),
+            c => {
+                out.push(c);
+                col += c.width().unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
+/// Word wrap measured in *display columns* (unicode-width), not chars: CJK
+/// and emoji occupy two cells each, so a char-count wrap ran past the right
+/// edge of the window. Tabs/control chars are normalized first. Char-safe
+/// (byte slicing here once panicked on multibyte words).
 fn wrap(s: &str, width: usize) -> Vec<String> {
     let width = width.max(4);
     let mut out: Vec<String> = Vec::new();
     for para in s.split('\n') {
+        let para = normalize(para);
         if para.is_empty() {
             out.push(String::new());
             continue;
         }
         let mut line = String::new();
-        let mut llen = 0usize;
-        for word in para.split(' ').filter(|w| !w.is_empty()) {
-            let mut w: Vec<char> = word.chars().collect();
-            if llen > 0 && llen + 1 + w.len().min(width) > width {
-                out.push(std::mem::take(&mut line));
-                llen = 0;
+        let mut lw = 0usize; // display width of `line`
+        // Chunks end with their space (last one bare): interior whitespace
+        // runs survive, and every space is a legal break point.
+        for tok in para.split_inclusive(' ') {
+            let tw = tok.width();
+            if lw + tw <= width {
+                line.push_str(tok);
+                lw += tw;
+                continue;
             }
-            if llen > 0 {
-                line.push(' ');
-                llen += 1;
+            let has_sp = tok.ends_with(' ');
+            let word = if has_sp { &tok[..tok.len() - 1] } else { tok };
+            if lw > 0 && word.width() > width - lw {
+                out.push(line.trim_end().to_string());
+                line.clear();
+                lw = 0;
             }
-            while w.len() > width.saturating_sub(llen) && llen < width {
-                let take = (width - llen).min(w.len());
-                line.extend(&w[..take]);
-                llen += take;
-                w = w[take..].to_vec();
-                if !w.is_empty() {
-                    out.push(std::mem::take(&mut line));
-                    llen = 0;
+            for c in word.chars() {
+                let cw = c.width().unwrap_or(0);
+                if lw + cw > width {
+                    out.push(line.trim_end().to_string());
+                    line.clear();
+                    lw = 0;
                 }
+                line.push(c);
+                lw += cw;
             }
-            if !w.is_empty() {
-                line.extend(&w[..]);
-                llen += w.len();
+            if has_sp && lw < width {
+                line.push(' ');
+                lw += 1;
             }
         }
-        out.push(line);
+        out.push(line.trim_end().to_string());
     }
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{composer_cursor, composer_height, composer_wrap, wrap};
+    use super::{complete_slash, composer_cursor, composer_height, composer_wrap, longest_common_prefix, wrap, SlashCompletion};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn slash_complete_unique_prefix_sends() {
+        match complete_slash("/comp") {
+            Some(SlashCompletion::Send(c)) => assert_eq!(c, "/compact"),
+            other => panic!("expected unique completion, got {other:?}"),
+        }
+        match complete_slash("/SCR") {
+            Some(SlashCompletion::Send(c)) => assert_eq!(c, "/screensaver"),
+            other => panic!("case-insensitive match expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_complete_ambiguous_fills_common_prefix() {
+        // /co → /compact, /continue, /context share only "/co" → fill (no-op here)
+        assert!(matches!(complete_slash("/co"), Some(SlashCompletion::Fill(_))));
+        // /res → /resume and /retry diverge at 'e'|'e'… common is "/re"
+        match complete_slash("/r") {
+            Some(SlashCompletion::Fill(p)) => assert_eq!(p, "/re"),
+            other => panic!("expected common-prefix fill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_complete_leaves_exact_and_argument_lines_alone() {
+        assert!(complete_slash("/compact").is_none());
+        assert!(complete_slash("/goal fix bug").is_none());
+        assert!(complete_slash("hello").is_none());
+        assert!(complete_slash("/zzz").is_none()); // unknown prefix → normal send → error msg
+    }
+
+    #[test]
+    fn lcp_stops_at_first_difference() {
+        assert_eq!(longest_common_prefix(&["/abc", "/abd"]), "/ab");
+        assert_eq!(longest_common_prefix(&["/solo"]), "/solo");
+        let none: &[&str] = &[];
+        assert_eq!(longest_common_prefix(none), "");
+    }
 
     #[test]
     fn wrap_basic() {
@@ -108,7 +184,30 @@ mod tests {
         assert_eq!(wrap("aaaaaaaaaaaaaa", 10), vec!["aaaaaaaaaa", "aaaa"]);
         // multibyte words must not panic nor split mid-char
         let w = wrap("🐧🐧🐧🐧🐧🐧 🦆x", 6);
-        assert!(w.iter().all(|l| l.chars().count() <= 6));
+        assert!(w.iter().all(|l| l.width() <= 6));
+    }
+
+    #[test]
+    fn wrap_never_exceeds_display_width() {
+        // CJK glyphs are two cells wide: char-count wrapping used to overflow.
+        for l in wrap("日本語のテキストがはみ出す", 10) {
+            assert!(l.width() <= 10, "line too wide: {l:?}");
+        }
+        let s = "mix中文字cjk本語emoji🐧🐧long-aaaaaaaaaaaaaaaaaaaa end";
+        for l in wrap(s, 12) {
+            assert!(l.width() <= 12, "line too wide: {l:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_normalizes_tabs_and_control_chars() {
+        let w = wrap("a\tb", 20);
+        assert_eq!(w, vec!["a   b".to_string()]); // tab → next stop of 4
+        let w = wrap("x\r\ny", 20);
+        assert_eq!(w, vec!["x".to_string(), "y".to_string()]);
+        for l in wrap("\tlong\tindented\tcode\twith\tlots\tof\ttabs", 16) {
+            assert!(l.width() <= 16, "line too wide: {l:?}");
+        }
     }
 }
 
@@ -160,7 +259,11 @@ fn toggle_hint(agent: bool) -> String {
 
 fn render_status(app: &App, f: &mut Frame, area: Rect) {
     let agent = app.mode == Mode::Agent;
-    let yolo = app.env.lock().map(|e| e.yolo).unwrap_or(false);
+    let (yolo, unlimited) = app
+        .env
+        .lock()
+        .map(|e| (e.yolo, e.unlimited_run))
+        .unwrap_or((false, false));
     let mut spans = vec![
         Span::styled(" 🐧 PC ", Style::default().fg(OMARCHY.bg).bg(shimmer(app.tick)).add_modifier(Modifier::BOLD)),
         Span::styled("  ", Style::default()),
@@ -173,6 +276,10 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
     ];
     if yolo {
         spans.push(Span::styled(" ⚠ YOLO ", Style::default().fg(Color::White).bg(OMARCHY.danger).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled("  ", Style::default()));
+    }
+    if unlimited {
+        spans.push(Span::styled(" ∞ UNLIMITED ", Style::default().fg(Color::Black).bg(OMARCHY.warn).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled("  ", Style::default()));
     }
     spans.push(Span::styled(short_path(&workspace_of(app)), Style::default().fg(if agent { OMARCHY.accent } else { OMARCHY.muted })));
@@ -350,16 +457,19 @@ fn render_agent_view(app: &mut App, f: &mut Frame, area: Rect, inline_plan: bool
         idx += 1;
     }
     render_composer(app, f, chunks[idx]);
-    render_keylegend(f, chunks[idx + 1], app.busy, app.queued.len());
+    let completing = typing_slash && complete_slash(&app.composer).is_some();
+    render_keylegend(f, chunks[idx + 1], app.busy, app.queued.lock().unwrap().len(), completing);
 
     if let Some(pa) = plan_area {
         render_plan(app, f, pa);
     }
 }
 
-const SLASH_COMMANDS: [(&str, &str); 17] = [
+pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/goal", "autonomous: plan → execute → verify"),
     ("/continue", "resume the unfinished goal · /continue <note>"),
+    ("/queue", "<text> queue an instruction for mid-run · lists/clears alone"),
+    ("/limit", "off|on — remove/restore run-length caps"),
     ("/new", "start a fresh session"),
     ("/sessions", "list saved sessions"),
     ("/resume", "[id] resume a session (latest)"),
@@ -376,6 +486,55 @@ const SLASH_COMMANDS: [(&str, &str); 17] = [
     ("/help", "all commands"),
     ("/quit", "exit penguin"),
 ];
+
+/// Outcome of pressing Enter on a partially typed slash command.
+#[derive(Debug)]
+pub(crate) enum SlashCompletion {
+    /// Fill the composer with this text and submit it immediately.
+    Send(String),
+    /// Fill the composer (longest common prefix) but keep editing.
+    Fill(String),
+}
+
+/// Basic autocomplete for a bare "/word" (no arguments typed yet): unique
+/// prefix → complete and send; ambiguous → fill the common prefix only.
+pub(crate) fn complete_slash(q: &str) -> Option<SlashCompletion> {
+    let q = q.to_lowercase();
+    if !q.starts_with('/') || q.len() < 2 || q.contains(' ') || q.contains('\n') {
+        return None;
+    }
+    if SLASH_COMMANDS.iter().any(|(c, _)| *c == q) {
+        return None; // exact match: submit as typed
+    }
+    let matches: Vec<&str> = SLASH_COMMANDS.iter().map(|(c, _)| *c).filter(|c| c.starts_with(&q)).collect();
+    match matches.len() {
+        0 => None, // unknown prefix: submit as typed and let /help explain
+        1 => Some(SlashCompletion::Send(matches[0].to_string())),
+        _ => Some(SlashCompletion::Fill(longest_common_prefix(&matches))),
+    }
+}
+
+fn longest_common_prefix(cmds: &[&str]) -> String {
+    let mut out = String::new();
+    for i in 0.. {
+        let mut common: Option<char> = None;
+        for c in cmds {
+            match c.chars().nth(i) {
+                Some(chi) => match common {
+                    None => common = Some(chi),
+                    Some(p) if p == chi => {}
+                    _ => return out,
+                },
+                None => return out,
+            }
+        }
+        match common {
+            Some(ch) => out.push(ch),
+            None => return out,
+        }
+    }
+    out
+}
 
 fn render_suggestions(app: &App, f: &mut Frame, area: Rect) {
     let q = app.composer.to_lowercase();
@@ -394,15 +553,20 @@ fn render_suggestions(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(0x16, 0x16, 0x1d))), area);
 }
 
-fn render_keylegend(f: &mut Frame, area: Rect, busy: bool, queued: usize) {
-    let text = if busy {
-        if queued > 0 {
-            &format!("enter queue · ⏳ {queued} waiting · esc stop agent · ctrl-space → shell")
+fn render_keylegend(f: &mut Frame, area: Rect, busy: bool, queued: usize, completing: bool) {
+    let owned;
+    let text: &str = if busy {
+        owned = if queued > 0 {
+            format!("enter queue · ⏳ {queued} waiting · esc stop agent · ctrl-space → shell")
         } else {
-            "enter queue · esc stop agent · ctrl-space → shell"
-        }
+            "enter queue · esc stop agent · ctrl-space → shell".to_string()
+        };
+        &owned
+    } else if completing {
+        owned = "enter completes & sends · keep typing to disambiguate · ctrl-space → shell".to_string();
+        &owned
     } else {
-        "enter send · shift/alt+enter newline · ↑↓ history · tab tool output · /help · ctrl-space → shell"
+        "enter send · shift/alt+enter newline · ↑↓ history · tab expands output & diffs · /help · ctrl-space → shell"
     };
     f.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC))),
@@ -573,6 +737,39 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     ]));
                 }
             }
+            Entry::Diff { path, added, removed, text } => {
+                out.push(Line::from(vec![
+                    Span::styled(" ◍ ", Style::default().fg(OMARCHY.accent2).add_modifier(Modifier::BOLD)),
+                    Span::styled(path.clone(), Style::default().fg(OMARCHY.accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" +{added}"), Style::default().fg(OMARCHY.success)),
+                    Span::styled(format!(" −{removed}"), Style::default().fg(OMARCHY.danger)),
+                ]));
+                let cap = if app.expand_tools { 100_000 } else { 24 };
+                let lines: Vec<&str> = text.lines().collect();
+                for l in lines.iter().take(cap) {
+                    let st = if l.starts_with('+') {
+                        Style::default().fg(OMARCHY.success)
+                    } else if l.starts_with('-') {
+                        Style::default().fg(OMARCHY.danger)
+                    } else if l.starts_with("@@") {
+                        Style::default().fg(OMARCHY.accent2).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(OMARCHY.muted)
+                    };
+                    for wl in wrap(l, width - 3) {
+                        out.push(Line::from(vec![
+                            Span::styled("   ", Style::default()),
+                            Span::styled(wl, st),
+                        ]));
+                    }
+                }
+                if lines.len() > cap {
+                    out.push(Line::from(Span::styled(
+                        format!("   … {} more diff lines · tab expands", lines.len() - cap),
+                        Style::default().fg(OMARCHY.warn).add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
         }
     }
     if !app.streaming.is_empty() {
@@ -587,19 +784,28 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         // answer token: show live chain-of-thought (tail) + an elapsed timer
         // so a slow endpoint never looks frozen.
         let secs = app.busy_since.elapsed().as_secs();
-        let tail: Vec<String> = {
-            let all: Vec<&str> = app.reasoning.lines().collect();
-            all.iter().rev().take(3).rev().map(|l| l.trim_end().to_string()).collect()
+        // Wrap the live chain of thought to the window width (long thoughts
+        // used to be clipped at the right edge). Only a tail slice is wrapped
+        // so per-frame cost stays bounded on multi-KB reasoning; the display
+        // keeps the last few wrapped rows, still ephemeral.
+        let rows: Vec<String> = if app.reasoning.is_empty() {
+            Vec::new()
+        } else {
+            let mut cut = app.reasoning.len().saturating_sub(4096);
+            while cut < app.reasoning.len() && !app.reasoning.is_char_boundary(cut) {
+                cut += 1;
+            }
+            wrap(&app.reasoning[cut..], width - 4).into_iter().rev().take(5).rev().collect()
         };
-        if !tail.is_empty() {
+        if !rows.is_empty() {
             out.push(Line::from(Span::styled(
                 format!(" ✻ reasoning · {secs}s"),
                 Style::default().fg(OMARCHY.accent2).add_modifier(Modifier::ITALIC),
             )));
-            for l in tail {
+            for l in rows {
                 out.push(Line::from(vec![
                     Span::styled("  │ ", Style::default().fg(OMARCHY.panel_line)),
-                    Span::styled(crate::providers::truncate(&l, width - 6).to_string(), Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC)),
+                    Span::styled(l, Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC)),
                 ]));
             }
         } else {
