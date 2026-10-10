@@ -11,6 +11,7 @@ mod setup_tui;
 mod skills;
 mod term;
 mod theme;
+mod web;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

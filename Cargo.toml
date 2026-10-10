@@ -24,6 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 regex = "1"
 walkdir = "2"
 dirs = "5"
+percent-encoding = "2"
 wait-timeout = "0.2"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 futures-util = "0.3"

@@ -94,6 +94,26 @@ pub fn save(s: &Session) -> Result<()> {
     Ok(())
 }
 
+/// Append a timestamped security/injection event to `sessions/<id>.injection.log`.
+/// Deliberately separate from the session JSON: compaction rewrites messages,
+/// but this evidence must survive it. Best-effort — never fails a turn.
+pub fn log_injection(session_id: &str, line: &str) {
+    #[cfg(test)]
+    {
+        let _ = (session_id, line);
+        return; // unit tests must not write into the user's config dir
+    }
+    #[allow(unreachable_code)]
+    {
+        use std::io::Write;
+        let ms = now_ms();
+        let path = dir().join(format!("{session_id}.injection.log"));
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "[{}] {}", fmt_ts(ms), line);
+        }
+    }
+}
+
 pub fn load(id: &str) -> Option<Session> {
     let raw = std::fs::read_to_string(path_for(id)).ok()?;
     serde_json::from_str(&raw).ok()

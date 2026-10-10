@@ -169,6 +169,47 @@ impl AgentConfig {
     }
 }
 
+/// Web research: DuckDuckGo search + the sandboxed page reader. Every field
+/// is optional; unset means the documented default (features ON).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Expose web_search / web_read tools to the agent. Some(false) = off.
+    pub enabled: Option<bool>,
+    /// Max results returned per search (1..=20, default 8).
+    pub max_results: Option<usize>,
+    /// Per-page download budget in seconds (5..=120, default 20).
+    pub fetch_timeout_secs: Option<u64>,
+    /// Tool-call rounds the sandboxed reader agent may spend on one page
+    /// before it must answer (1..=8, default 4).
+    pub reader_max_iterations: Option<usize>,
+    /// Hosts that are never contacted and never appear in results — not by
+    /// web_read, not by web_search, and not through a shell command either
+    /// (the safety gate hard-denies any command mentioning one). Substring
+    /// match against the host part of URLs/commands, case-insensitive.
+    pub blocked_hosts: Vec<String>,
+}
+
+impl WebConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+    /// Blocked hosts, lowercased and whitespace-trimmed.
+    pub fn blocked_hosts(&self) -> Vec<String> {
+        self.blocked_hosts.iter().map(|h| h.trim().to_lowercase()).filter(|h| !h.is_empty()).collect()
+    }
+    pub fn max_results(&self) -> usize {
+        self.max_results.unwrap_or(8).clamp(1, 20)
+    }
+    pub fn fetch_timeout(&self) -> std::time::Duration {
+        let s = self.fetch_timeout_secs.unwrap_or(0);
+        std::time::Duration::from_secs(if s == 0 { 20 } else { s.clamp(5, 120) })
+    }
+    pub fn reader_max_iterations(&self) -> usize {
+        self.reader_max_iterations.filter(|n| *n > 0).unwrap_or(4).min(8)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -184,6 +225,7 @@ pub struct Config {
     pub providers: Vec<Provider>,
     pub active_provider: Option<String>,
     pub agent: AgentConfig,
+    pub web: WebConfig,
     pub ui: UiConfig,
     pub rules: Vec<Rule>,
 }
@@ -357,5 +399,41 @@ mod tests {
         assert_eq!(c.agent.max_reasoning_tokens(), None);
         c.agent.max_reasoning_tokens = Some(4096);
         assert_eq!(c.agent.max_reasoning_tokens(), Some(4096));
+    }
+
+    #[test]
+    fn web_defaults_are_on_and_clamped() {
+        let c = Config::default();
+        // Web research ships enabled; opt-out is explicit.
+        assert!(c.web.enabled());
+        assert_eq!(c.web.max_results(), 8);
+        assert_eq!(c.web.fetch_timeout(), std::time::Duration::from_secs(20));
+        assert_eq!(c.web.reader_max_iterations(), 4);
+        // Out-of-range values are clamped by the accessors, never honored.
+        let mut c = Config::default();
+        c.web.enabled = Some(false);
+        assert!(!c.web.enabled());
+        c.web.max_results = Some(500);
+        assert_eq!(c.web.max_results(), 20);
+        c.web.max_results = Some(0);
+        assert_eq!(c.web.max_results(), 1);
+        c.web.fetch_timeout_secs = Some(9999);
+        assert_eq!(c.web.fetch_timeout(), std::time::Duration::from_secs(120));
+        c.web.reader_max_iterations = Some(0);
+        assert_eq!(c.web.reader_max_iterations(), 4);
+        c.web.reader_max_iterations = Some(64);
+        assert_eq!(c.web.reader_max_iterations(), 8);
+    }
+
+    #[test]
+    fn web_section_roundtrips_through_toml() {
+        let mut c = Config::default();
+        c.web.enabled = Some(false);
+        c.web.max_results = Some(3);
+        let txt = toml::to_string_pretty(&c).unwrap();
+        assert!(txt.contains("[web]"), "toml was: {txt}");
+        let back: Config = toml::from_str(&txt).unwrap();
+        assert!(!back.web.enabled());
+        assert_eq!(back.web.max_results(), 3);
     }
 }

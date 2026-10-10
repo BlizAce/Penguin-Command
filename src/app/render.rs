@@ -1,4 +1,4 @@
-use super::{App, Entry, Mode};
+use super::{App, Entry, Mode, QuestionModal};
 use crate::theme::*;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -221,7 +221,6 @@ pub fn render(app: &mut App, f: &mut Frame) {
     }
 
     let top = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
-    render_status(app, f, top[0]);
 
     if app.mode == Mode::Agent {
         // unified window: the agent owns the whole viewport below the status bar
@@ -233,14 +232,20 @@ pub fn render(app: &mut App, f: &mut Frame) {
         } else {
             top[1]
         };
+        // drawn before the status bar so the transcript can clamp agent_scroll
         render_agent_view(app, f, body, sidebar_w == 0);
     } else {
         render_shell(app, f, top[1]);
     }
+    render_status(app, f, top[0]);
 
     if let Some(m) = &app.permission {
         let (sel, title, detail) = (m.sel, m.title.clone(), m.detail.clone());
         render_permission(f, area, sel, &title, &detail);
+    }
+
+    if let Some(m) = &app.question {
+        render_question(f, area, m);
     }
 
     if let Some(m) = &app.secret {
@@ -284,7 +289,10 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
     }
     spans.push(Span::styled(short_path(&workspace_of(app)), Style::default().fg(if agent { OMARCHY.accent } else { OMARCHY.muted })));
     if app.scroll > 0 {
-        spans.push(Span::styled(format!("  ↑{} ", app.scroll), Style::default().fg(OMARCHY.warn)));
+        spans.push(Span::styled(format!(" ↑{} ", app.scroll), Style::default().fg(OMARCHY.warn)));
+    }
+    if agent && app.agent_scroll > 0 {
+        spans.push(Span::styled(format!(" ↑{} scrolled ", app.agent_scroll), Style::default().fg(OMARCHY.warn)));
     }
     if app.ctx_window > 0 && app.ctx_used > 0 {
         let pct = app.ctx_used * 100 / app.ctx_window;
@@ -300,7 +308,13 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
             }
             None => String::new(),
         };
-        format!("{} ⏱{secs}s{tps} ", spinner(app.tick))
+        // live "what is it doing right now" badge
+        let what = match &app.activity {
+            Some(t) => format!("⚙ {t}"),
+            None if !app.streaming.is_empty() => "✎ writing".into(),
+            None => "✻ thinking".into(),
+        };
+        format!("{} {what} · ⏱{secs}s{tps} ", spinner(app.tick))
     } else {
         String::new()
     };
@@ -441,7 +455,10 @@ fn render_agent_view(app: &mut App, f: &mut Frame, area: Rect, inline_plan: bool
     // transcript + optional slash suggestions + composer + key legend
     let typing_slash = !app.busy && app.composer.starts_with('/');
     let comp_w = (tr_area.width as usize).saturating_sub(4).max(1);
-    let comp_cap = (tr_area.height as usize).saturating_sub(if typing_slash { 3 } else { 2 }).max(1);
+    // A huge paste must never turn the composer into a full-screen box: it
+    // gets at most a third of the view (8 rows), and the notice about any
+    // truncation stays visible above it.
+    let comp_cap = ((tr_area.height as usize) / 3).clamp(1, 8);
     let comp_h = composer_height(app.comp_cur, &app.composer, comp_w).min(comp_cap) as u16;
     let mut constraints = vec![Constraint::Min(1)];
     if typing_slash {
@@ -470,6 +487,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/continue", "resume the unfinished goal · /continue <note>"),
     ("/queue", "<text> queue an instruction for mid-run · lists/clears alone"),
     ("/limit", "off|on — remove/restore run-length caps"),
+    ("/search", "<query> web search via the sandboxed page reader"),
     ("/new", "start a fresh session"),
     ("/sessions", "list saved sessions"),
     ("/resume", "[id] resume a session (latest)"),
@@ -557,16 +575,16 @@ fn render_keylegend(f: &mut Frame, area: Rect, busy: bool, queued: usize, comple
     let owned;
     let text: &str = if busy {
         owned = if queued > 0 {
-            format!("enter queue · ⏳ {queued} waiting · esc stop agent · ctrl-space → shell")
+            format!("enter queue · ⏳ {queued} waiting · esc stop agent · wheel scrolls · ctrl-space → shell")
         } else {
-            "enter queue · esc stop agent · ctrl-space → shell".to_string()
+            "enter queue · esc stop agent · wheel scrolls · ctrl-space → shell".to_string()
         };
         &owned
     } else if completing {
         owned = "enter completes & sends · keep typing to disambiguate · ctrl-space → shell".to_string();
         &owned
     } else {
-        "enter send · shift/alt+enter newline · ↑↓ history · tab expands output & diffs · /help · ctrl-space → shell"
+        "enter send · shift/alt+enter newline · ↑↓ history · pgup/wheel scroll · tab expands output & diffs · /help · ctrl-space → shell"
     };
     f.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC))),
@@ -601,6 +619,18 @@ fn render_sidebar(app: &App, f: &mut Frame, area: Rect) {
                 ]));
             }
             lines.push(Line::from(""));
+            if !app.plan.is_empty() {
+                let done = app.plan.iter().filter(|(_, s)| s == "done").count();
+                let failed = app.plan.iter().filter(|(_, s)| s == "failed").count();
+                let mut prog = format!(" {done}/{} steps done", app.plan.len());
+                if failed > 0 {
+                    prog.push_str(&format!(" · {failed} failed"));
+                }
+                lines.push(Line::from(Span::styled(
+                    prog,
+                    Style::default().fg(if failed > 0 { OMARCHY.danger } else { OMARCHY.muted }),
+                )));
+            }
             if app.plan.is_empty() {
                 lines.push(Line::from(Span::styled(
                     if app.busy { "planning steps…" } else { "awaiting plan" },
@@ -770,6 +800,28 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     )));
                 }
             }
+            Entry::Question { question, answer } => {
+                for (i, l) in wrap(question, width - 4).into_iter().enumerate() {
+                    out.push(Line::from(vec![
+                        Span::styled(if i == 0 { "❓ " } else { "  " }, Style::default().fg(OMARCHY.warn).add_modifier(Modifier::BOLD)),
+                        Span::styled(l, Style::default().fg(OMARCHY.text)),
+                    ]));
+                }
+                match answer {
+                    Some(a) => {
+                        for (i, l) in wrap(a, width - 6).into_iter().enumerate() {
+                            out.push(Line::from(vec![
+                                Span::styled(if i == 0 { " ↳ " } else { "   " }, Style::default().fg(OMARCHY.success)),
+                                Span::styled(l, Style::default().fg(OMARCHY.success)),
+                            ]));
+                        }
+                    }
+                    None => out.push(Line::from(Span::styled(
+                        "   (dismissed — agent proceeds on its own)",
+                        Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC),
+                    ))),
+                }
+            }
         }
     }
     if !app.streaming.is_empty() {
@@ -836,17 +888,35 @@ fn crate_tick(app: &App) -> u32 {
     app.tick
 }
 
-fn render_transcript(app: &App, f: &mut Frame, area: Rect) {
+fn render_transcript(app: &mut App, f: &mut Frame, area: Rect) {
     let width = area.width.max(8) as usize;
     let mut all = transcript_lines(app, width);
     let centered = all.is_empty();
     if centered {
+        app.agent_scroll = 0;
         all = empty_state_art(width, app.tick);
+    } else {
+        // clamp scrollback: the top of the transcript is as far up as it goes
+        let hc = area.height as usize;
+        app.agent_scroll = app.agent_scroll.min(all.len().saturating_sub(hc));
     }
     let h = area.height as usize;
     let end = all.len().saturating_sub(app.agent_scroll);
     let start = end.saturating_sub(h);
-    let visible = all[start..end].to_vec();
+    let mut visible = all[start..end].to_vec();
+    if !centered && app.agent_scroll > 0 {
+        // the hint row replaces a content row so it's never clipped away
+        if visible.len() >= h {
+            visible.pop();
+        }
+        visible.push(Line::from(Span::styled(
+            format!(
+                " ↓ {} more lines · PgDn / wheel down · ctrl+End back to live",
+                app.agent_scroll
+            ),
+            Style::default().fg(OMARCHY.warn).add_modifier(Modifier::ITALIC),
+        )));
+    }
     let para = Paragraph::new(visible).alignment(if centered {
         ratatui::layout::Alignment::Center
     } else {
@@ -1009,6 +1079,100 @@ fn render_permission(f: &mut Frame, area: Rect, sel: usize, title: &str, detail:
         Paragraph::new(Span::styled("↑↓ select · enter confirm · y/a/n shortcuts · esc = deny once", Style::default().fg(OMARCHY.muted))),
         chunks[3],
     );
+}
+
+/// Modal for the agent's ask_user tool: a selectable list of options plus a
+/// built-in "type your own answer" row. `sel == options.len()` marks the
+/// custom row; `typing` switches the box into free-text entry.
+fn render_question(f: &mut Frame, area: Rect, m: &QuestionModal) {
+    let width = 76.min(area.width.saturating_sub(4));
+    if width < 30 || area.height < 10 {
+        return;
+    }
+    let q_lines = wrap(&m.question, width as usize - 8);
+    let q_h = (q_lines.len() as u16).min(3);
+    let n_rows = (m.options.len() + 1) as u16; // options + custom row
+    let height = (q_h + n_rows + (if m.typing { 3 } else { 0 }) + 7).min(area.height.saturating_sub(2));
+    let box_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(OMARCHY.agent_line))
+        .title(Span::styled(
+            " ❓ the agent is asking ",
+            Style::default().fg(OMARCHY.accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Rgb(0x18, 0x14, 0x1c)));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+
+    let chunks_v = [
+        Constraint::Length(q_h),
+        Constraint::Length(if m.typing { 3 } else { n_rows }),
+        Constraint::Min(1),
+    ];
+    let chunks = Layout::vertical(chunks_v).split(inner);
+
+    let q_par = Paragraph::new(
+        q_lines
+            .iter()
+            .take(q_h as usize)
+            .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(OMARCHY.warn).add_modifier(Modifier::BOLD))))
+            .collect::<Vec<_>>(),
+    );
+    f.render_widget(q_par, chunks[0]);
+
+    let sel_style = Style::default().fg(Color::Rgb(0x14, 0x10, 0x20)).bg(shimmer(0)).add_modifier(Modifier::BOLD);
+    if m.typing {
+        let max_t = inner.width.saturating_sub(6) as usize;
+        let typed: String = m.buf.chars().take(max_t).collect();
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {typed}▌"), Style::default().fg(OMARCHY.text))))
+                .block(Block::bordered().border_type(BorderType::Rounded).border_style(Style::default().fg(OMARCHY.accent))),
+            chunks[1],
+        );
+        let cx = chunks[1].x + 2 + typed.width() as u16;
+        f.set_cursor_position((cx, chunks[1].y + 1));
+    } else {
+        let opt_w = inner.width.saturating_sub(8) as usize;
+        for (i, label) in m.options.iter().enumerate() {
+            if i as u16 >= chunks[1].height {
+                break;
+            }
+            let selected = i == m.sel;
+            let text = format!(" {}. {} ", i + 1, crate::providers::truncate(label, opt_w));
+            let line = Line::from(Span::styled(text, if selected { sel_style } else { Style::default().fg(OMARCHY.text) }));
+            let r = Rect { x: chunks[1].x, y: chunks[1].y + i as u16, width: chunks[1].width, height: 1 };
+            f.render_widget(Paragraph::new(line), r);
+        }
+        // the always-available custom-answer row
+        let ci = m.options.len();
+        if (ci as u16) < chunks[1].height {
+            let selected = m.sel == ci;
+            let line = Line::from(Span::styled(
+                "  c. ✎ type your own answer… ",
+                if selected {
+                    sel_style
+                } else {
+                    Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC)
+                },
+            ));
+            let r = Rect { x: chunks[1].x, y: chunks[1].y + ci as u16, width: chunks[1].width, height: 1 };
+            f.render_widget(Paragraph::new(line), r);
+        }
+    }
+
+    let hint = if m.typing {
+        "type your answer · enter send · esc back to options"
+    } else {
+        "↑↓ select · enter confirm · 1-9 quick pick · c custom answer · esc skip (agent decides alone)"
+    };
+    f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(OMARCHY.muted))), chunks[2]);
 }
 
 /// Modal for entering a password a child command (sudo) is waiting on.

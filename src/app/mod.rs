@@ -10,7 +10,7 @@ use crate::term::Emulator;
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     execute,
 };
@@ -39,6 +39,9 @@ pub enum Entry {
     Goal { summary: String, evidence: String },
     /// Unified diff of an agent file edit, rendered inline automatically.
     Diff { path: String, added: usize, removed: usize, text: String },
+    /// An ask_user exchange: the question and how the user answered
+    /// (Some = picked or typed answer, None = dismissed).
+    Question { question: String, answer: Option<String> },
 }
 
 pub struct PermModal {
@@ -54,6 +57,19 @@ pub struct SecretModal {
     pub prompt: String,
     pub buf: String,
     pub tx: Sender<Option<String>>,
+}
+
+/// Selectable question from the agent's ask_user tool. The last list entry is
+/// always "type your own answer"; selecting it switches to free-text editing.
+pub struct QuestionModal {
+    pub question: String,
+    pub options: Vec<String>,
+    pub tx: Sender<Option<String>>,
+    /// 0..options.len() = an option; == options.len() = the custom-answer row.
+    pub sel: usize,
+    /// True while typing a custom answer (keys edit `buf` instead of the list).
+    pub typing: bool,
+    pub buf: String,
 }
 
 pub struct Options {
@@ -88,6 +104,7 @@ pub struct App {
     hist_pos: usize,
     pub permission: Option<PermModal>,
     pub secret: Option<SecretModal>,
+    pub question: Option<QuestionModal>,
     pub scroll: usize,
     pub agent_scroll: usize,
     pub tick: u32,
@@ -106,6 +123,10 @@ pub struct App {
     /// First answer token of the current turn; drives the tok/s meter.
     pub first_token_at: Option<std::time::Instant>,
     pub recv_chars: usize,
+    /// Tool currently executing — shown live in the status bar while busy.
+    pub activity: Option<String>,
+    /// Tool calls performed this turn; reported by the end-of-turn summary.
+    pub turn_tools: usize,
     /// Last submitted prompt, for /retry after a failed turn.
     last_prompt: Option<(String, bool)>,
     /// Instructions typed while the agent is mid-run. Shared with the agent
@@ -136,6 +157,8 @@ impl App {
             self.busy_since = std::time::Instant::now();
             self.first_token_at = None;
             self.recv_chars = 0;
+            self.activity = None;
+            self.turn_tools = 0;
             self.last_prompt = Some((text.clone(), goal));
             let _ = tx.send(AgentCommand::Prompt { text, goal });
         } else {
@@ -159,6 +182,8 @@ impl App {
             self.busy_since = std::time::Instant::now();
             self.first_token_at = None;
             self.recv_chars = 0;
+            self.activity = None;
+            self.turn_tools = 0;
             let label = if note.is_empty() {
                 "↻ continuing goal…".to_string()
             } else {
@@ -181,6 +206,7 @@ impl App {
                 "/goal <text> autonomous plan+execute+verify · /continue [note] resume the unfinished goal · \
                  /queue <text> add instructions mid-run (/queue lists, /queue clear) · \
                  /limit off|on remove/restore run-length caps · \
+                 /search <q> web search (sandboxed page reader) · \
                  /new fresh session · /sessions list · /resume [id] · /skills list saved skills · \
                  /compact compact context now · /retry resend last prompt · /effort cycle reasoning depth · \
                  /context usage · /yolo bypass approvals (dangerous) · /providers setup UI · /model [name] · \
@@ -225,6 +251,22 @@ impl App {
                 } else {
                     // Idle: nothing to wait for — run it right away.
                     self.send_prompt(rest.to_string(), false);
+                }
+            }
+            "search" => {
+                if rest.is_empty() {
+                    self.transcript.push(Entry::Error("usage: /search <what to look up>".into()));
+                } else if self.busy {
+                    self.transcript.push(Entry::Info("agent is still working — esc to stop it first".into()));
+                } else {
+                    // Sugar for the research flow: search → pick hits → read in
+                    // the sandbox → report. Keeps the work (and any injection)
+                    // inside the agent's tool loop instead of the UI thread.
+                    self.send_prompt(format!(
+                        "Look this up on the web: {rest}\nUse web_search, choose the most relevant \
+                         hits, read the best 1–3 with web_read, and summarize what you learned with \
+                         source URLs."
+                    ), false);
                 }
             }
             "limit" => {
@@ -545,6 +587,7 @@ impl App {
                 AgentEvent::ToolStarted { name, args, .. } => {
                     self.streaming.clear();
                     self.reasoning.clear();
+                    self.activity = Some(name.clone());
                     self.transcript.push(Entry::Tool {
                         name,
                         args,
@@ -554,6 +597,8 @@ impl App {
                     });
                 }
                 AgentEvent::ToolFinished { ok, output, .. } => {
+                    self.turn_tools += 1;
+                    self.activity = None;
                     if let Some(Entry::Tool { status, output: slot, .. }) =
                         self.transcript.iter_mut().rev().find(|e| matches!(e, Entry::Tool { status, .. } if status == "running"))
                     {
@@ -574,6 +619,12 @@ impl App {
                     }
                     self.secret = Some(SecretModal { prompt, buf: String::new(), tx });
                 }
+                AgentEvent::NeedQuestion { question, options, tx } => {
+                    if let Some(old) = self.question.take() {
+                        let _ = old.tx.send(None);
+                    }
+                    self.question = Some(QuestionModal { question, options, tx, sel: 0, typing: false, buf: String::new() });
+                }
                 AgentEvent::Info(s) => self.transcript.push(Entry::Info(s)),
                 AgentEvent::ErrorText(s) => self.transcript.push(Entry::Error(s)),
                 AgentEvent::GoalFinished { summary, evidence } => {
@@ -589,6 +640,7 @@ impl App {
                 AgentEvent::Done => {
                     self.busy = false;
                     self.reasoning.clear();
+                    self.activity = None;
                     for e in &mut self.transcript {
                         if let Entry::Tool { status, .. } = e {
                             if status == "running" {
@@ -596,6 +648,16 @@ impl App {
                             }
                         }
                     }
+                    // Turn summary: a visible closing beat so the screen never
+                    // just silently stops moving.
+                    let secs = self.busy_since.elapsed().as_secs();
+                    let toks = self.recv_chars / 4;
+                    self.transcript.push(Entry::Info(format!(
+                        "✻ turn done · {secs}s · {} tool call{} · ~{} tok out",
+                        self.turn_tools,
+                        if self.turn_tools == 1 { "" } else { "s" },
+                        toks
+                    )));
                     // give a fresh idle window after the agent finishes working
                     self.last_input = std::time::Instant::now();
                     // Anything still queued (typed after the agent's last
@@ -633,6 +695,15 @@ impl App {
         }
     }
 
+    /// Resolve the open ask_user modal: Some(answer) was picked/typed,
+    /// None means the user dismissed it.
+    fn answer_question(&mut self, answer: Option<String>) {
+        if let Some(m) = self.question.take() {
+            let _ = m.tx.send(answer.clone());
+            self.transcript.push(Entry::Question { question: m.question, answer });
+        }
+    }
+
     pub fn wake(&mut self) {
         self.screensaving = false;
         self.last_input = std::time::Instant::now();
@@ -641,7 +712,7 @@ impl App {
     /// Omarchy-style idle screensaver: after [ui] idle_secs without input,
     /// animated penguins take over the viewport until any key is pressed.
     fn maybe_screensave(&mut self) {
-        if self.screensaving || self.busy || self.permission.is_some() || self.secret.is_some() {
+        if self.screensaving || self.busy || self.permission.is_some() || self.secret.is_some() || self.question.is_some() {
             return;
         }
         let idle = self.cfg.ui.idle_secs.unwrap_or(150);
@@ -843,6 +914,7 @@ pub fn run(opts: Options) -> Result<()> {
         hist_pos: 0,
         permission: None,
         secret: None,
+        question: None,
         scroll: 0,
         agent_scroll: 0,
         tick: 0,
@@ -859,6 +931,8 @@ pub fn run(opts: Options) -> Result<()> {
         busy_since: std::time::Instant::now(),
         first_token_at: None,
         recv_chars: 0,
+        activity: None,
+        turn_tools: 0,
         last_prompt: None,
         queued: queue,
         expand_tools: false,
@@ -880,6 +954,15 @@ pub fn run(opts: Options) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
+    // Mouse capture: wheel scrolls the agent transcript / shell scrollback.
+    // (The embedded PTY never receives mouse bytes either way — inner apps
+    // were never wired for it — so nothing regresses.)
+    let _ = execute!(stdout, EnableMouseCapture);
+    // Bracketed paste on OUR stdin: without it a multi-line paste arrives as
+    // a torrent of individual keystrokes and every newline inside fires its
+    // own Enter (each pasted line becomes a separate prompt/command). With it
+    // the terminal delivers one Event::Paste for the whole block.
+    let _ = execute!(stdout, EnableBracketedPaste);
     // kitty keyboard protocol (disambiguate flag): lets us tell Shift+Enter
     // from plain Enter. Terminals without support ignore this sequence entirely.
     let _ = stdout.write_all(b"\x1b[>1u");
@@ -891,6 +974,7 @@ pub fn run(opts: Options) -> Result<()> {
     disable_raw_mode()?;
     let mut stdout = io::stdout();
     let _ = stdout.write_all(b"\x1b[<u");
+    let _ = execute!(stdout, DisableMouseCapture, DisableBracketedPaste);
     execute!(stdout, Show, LeaveAlternateScreen)?;
     let _ = killer.kill();
     if let Some(tx) = &app.agent_tx {
@@ -917,69 +1001,165 @@ fn main_loop(
         if !event::poll(timeout)? {
             continue;
         }
-        match event::read()? {
-            Event::Resize(cols, rows) => {
-                app.wake();
-                app.resize(rows, cols);
+        // Process every event already in the queue before drawing again: a
+        // large paste or key burst used to cost one full redraw per event and
+        // could wedge the UI for minutes.
+        let mut quit = false;
+        loop {
+            if handle_event(app, event::read()?, killer)? {
+                quit = true;
+                break;
             }
-            Event::Mouse(_) => app.wake(),
-            Event::Paste(text) => {
-                if app.screensaving {
-                    app.wake();
-                    continue;
-                }
-                app.wake();
-                if app.mode == Mode::Shell {
-                    let bracketed = app.emu.lock().unwrap().term.bracketed_paste;
-                    let _ = app.writer.lock().unwrap().write_all(&encode_paste(&text, bracketed));
-                } else {
-                    app.composer.insert_str(app.comp_cur, &text);
-                    app.comp_cur += text.chars().count();
-                }
+            if !event::poll(std::time::Duration::ZERO)? {
+                break;
             }
-            Event::Key(k) => {
-                if k.kind == KeyEventKind::Release {
-                    continue;
-                }
-                if k.modifiers.contains(KeyModifiers::CONTROL)
-                    && k.code == KeyCode::Char('q')
-                    && app.permission.is_none()
-                    && app.secret.is_none()
-                {
-                    let _ = killer.kill();
-                    break;
-                }
-                if app.screensaving {
-                    app.wake();
-                    continue;
-                }
-                // any keystroke counts as activity — without this the
-                // screensaver interrupts people who type for a living
-                app.wake();
-                if app.secret.is_some() {
-                    handle_secret_key(app, &k);
-                    continue;
-                }
-                if app.permission.is_some() {
-                    handle_permission_key(app, &k);
-                    continue;
-                }
-                if k.code == app.toggle.0 && k.modifiers == app.toggle.1 {
-                    let (cols, rows) = crossterm::terminal::size()?;
-                    let new_mode = if app.mode == Mode::Shell { Mode::Agent } else { Mode::Shell };
-                    app.set_mode(new_mode);
-                    app.resize(rows, cols);
-                    continue;
-                }
-                match app.mode {
-                    Mode::Shell => handle_shell_key(app, &k),
-                    Mode::Agent => handle_agent_key(app, &k)?,
-                }
-            }
-            _ => {}
+        }
+        if quit {
+            break;
         }
     }
     Ok(())
+}
+
+/// One input event. Returns true when penguin should exit (Ctrl+Q).
+fn handle_event(
+    app: &mut App,
+    ev: Event,
+    killer: &mut Box<dyn portable_pty::ChildKiller + Send + Sync>,
+) -> Result<bool> {
+    match ev {
+        Event::Resize(cols, rows) => {
+            app.wake();
+            app.resize(rows, cols);
+        }
+        Event::Mouse(m) => {
+            use crossterm::event::MouseEventKind;
+            // Wheel scrolls the agent transcript / shell scrollback.
+            let delta = match m.kind {
+                MouseEventKind::ScrollUp => 3i64,
+                MouseEventKind::ScrollDown => -3,
+                _ => 0,
+            };
+            if delta != 0 {
+                if app.mode == Mode::Agent {
+                    app.agent_scroll = (app.agent_scroll as i64 + delta).max(0) as usize;
+                } else {
+                    let max = app.emu.lock().unwrap().term.history_len();
+                    app.scroll = ((app.scroll as i64 + delta).max(0) as usize).min(max);
+                }
+            }
+            app.wake();
+        }
+        Event::Paste(text) => {
+            if app.screensaving {
+                app.wake();
+                return Ok(false);
+            }
+            app.wake();
+            if app.secret.is_some() || app.permission.is_some() || app.question.is_some() {
+                // A modal owns the keyboard: never smuggle pasted text into
+                // the shell (or composer) behind a pending dialog.
+                return Ok(false);
+            }
+            if app.mode == Mode::Shell {
+                let bracketed = app.emu.lock().unwrap().term.bracketed_paste;
+                let _ = app.writer.lock().unwrap().write_all(&encode_paste(&text, bracketed));
+            } else {
+                // Multi-line pastes land in the composer as one block: nothing
+                // is submitted until the user presses Enter themselves.
+                let (clean, dropped) = sanitize_paste(&text);
+                if !clean.is_empty() {
+                    app.composer.insert_str(app.comp_cur, &clean);
+                    app.comp_cur += clean.chars().count();
+                }
+                if dropped > 0 {
+                    app.transcript.push(Entry::Info(format!(
+                        "⚠ paste capped at {} bytes ({dropped} chars dropped) — huge content belongs in a file the agent can read",
+                        MAX_PASTE_BYTES
+                    )));
+                }
+            }
+        }
+        Event::Key(k) => {
+            if k.kind == KeyEventKind::Release {
+                return Ok(false);
+            }
+            if k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.code == KeyCode::Char('q')
+                && app.permission.is_none()
+                && app.secret.is_none()
+            {
+                let _ = killer.kill();
+                return Ok(true);
+            }
+            if app.screensaving {
+                app.wake();
+                return Ok(false);
+            }
+            // any keystroke counts as activity — without this the
+            // screensaver interrupts people who type for a living
+            app.wake();
+            if app.secret.is_some() {
+                handle_secret_key(app, &k);
+                return Ok(false);
+            }
+            if app.question.is_some() {
+                handle_question_key(app, &k);
+                return Ok(false);
+            }
+            if app.permission.is_some() {
+                handle_permission_key(app, &k);
+                return Ok(false);
+            }
+            if k.code == app.toggle.0 && k.modifiers == app.toggle.1 {
+                let (cols, rows) = crossterm::terminal::size()?;
+                let new_mode = if app.mode == Mode::Shell { Mode::Agent } else { Mode::Shell };
+                app.set_mode(new_mode);
+                app.resize(rows, cols);
+                return Ok(false);
+            }
+            match app.mode {
+                Mode::Shell => handle_shell_key(app, &k),
+                Mode::Agent => handle_agent_key(app, &k)?,
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Largest paste accepted into the agent composer. Beyond this the tail is
+/// dropped with a visible notice — megabytes in a one-line prompt box make
+/// the UI (and the model prompt) useless; big content belongs in a file.
+pub const MAX_PASTE_BYTES: usize = 65_536;
+
+/// Make pasted text safe and sane for the composer: CRLF → LF, tabs to
+/// spaces, control characters stripped (ESC sequences in particular must
+/// never ride through the transcript into the prompt), tail capped.
+/// Returns the clean text plus how many source chars were dropped.
+fn sanitize_paste(text: &str) -> (String, usize) {
+    let total = text.chars().count();
+    let mut out = String::with_capacity(text.len().min(MAX_PASTE_BYTES + 16));
+    let mut dropped = 0usize;
+    let mut seen = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        seen += 1;
+        if out.len() >= MAX_PASTE_BYTES {
+            // current char and everything after it never make it in
+            dropped += total - seen + 1;
+            break;
+        }
+        match c {
+            // a CR directly followed by LF is one newline, produced by the LF
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' | '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            c if c.is_control() => dropped += 1,
+            c => out.push(c),
+        }
+    }
+    (out, dropped)
 }
 
 /// Hidden password entry: chars are buffered (never echoed), enter submits to
@@ -1008,6 +1188,84 @@ fn handle_secret_key(app: &mut App, k: &event::KeyEvent) {
                 app.transcript.push(Entry::Info("password prompt cancelled".into()));
             }
         }
+        _ => {}
+    }
+}
+
+/// Selectable question from the agent's ask_user tool: ↑↓/1-9 pick an option,
+/// the last row (or `c`) switches to typing a custom answer; enter submits,
+/// esc dismisses (the agent is told it got no answer).
+fn handle_question_key(app: &mut App, k: &event::KeyEvent) {
+    let typing = app.question.as_ref().map(|m| m.typing).unwrap_or(false);
+    if typing {
+        match k.code {
+            KeyCode::Char(c) if !c.is_control() => {
+                if let Some(m) = app.question.as_mut() {
+                    m.buf.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(m) = app.question.as_mut() {
+                    m.buf.pop();
+                }
+            }
+            KeyCode::Enter => {
+                let ans = app.question.as_ref().map(|m| m.buf.trim().to_string()).unwrap_or_default();
+                if ans.is_empty() {
+                    // Empty submit: fall back to the option list, don't answer nothing.
+                    if let Some(m) = app.question.as_mut() {
+                        m.typing = false;
+                    }
+                } else {
+                    app.answer_question(Some(ans));
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(m) = app.question.as_mut() {
+                    m.typing = false;
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    let n = app.question.as_ref().map(|m| m.options.len()).unwrap_or(0);
+    match k.code {
+        KeyCode::Up => {
+            if let Some(m) = app.question.as_mut() {
+                m.sel = if m.sel == 0 { n } else { m.sel - 1 };
+            }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if let Some(m) = app.question.as_mut() {
+                m.sel = (m.sel + 1) % (n + 1);
+            }
+        }
+        KeyCode::Enter => {
+            let (sel, option) = match app.question.as_ref() {
+                Some(m) => (m.sel, m.options.get(m.sel).cloned()),
+                None => return,
+            };
+            if sel >= n {
+                if let Some(m) = app.question.as_mut() {
+                    m.typing = true;
+                }
+            } else if let Some(opt) = option {
+                app.answer_question(Some(opt));
+            }
+        }
+        KeyCode::Char('c') => {
+            if let Some(m) = app.question.as_mut() {
+                m.typing = true;
+            }
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            let option = app.question.as_ref().and_then(|m| m.options.get(c as usize - '1' as usize).cloned());
+            if let Some(opt) = option {
+                app.answer_question(Some(opt));
+            }
+        }
+        KeyCode::Esc => app.answer_question(None),
         _ => {}
     }
 }
@@ -1083,10 +1341,12 @@ fn handle_agent_key(app: &mut App, k: &event::KeyEvent) -> Result<()> {
         }
         KeyCode::Left => app.comp_cur = app.comp_cur.saturating_sub(1),
         KeyCode::Right => app.comp_cur = (app.comp_cur + 1).min(app.composer.chars().count()),
+        KeyCode::Home if k.modifiers.contains(KeyModifiers::CONTROL) => app.agent_scroll = usize::MAX / 4,
+        KeyCode::End if k.modifiers.contains(KeyModifiers::CONTROL) => app.agent_scroll = 0,
         KeyCode::Home => app.comp_cur = 0,
         KeyCode::End => app.comp_cur = app.composer.chars().count(),
-        KeyCode::PageUp if shift => app.agent_scroll += 5,
-        KeyCode::PageDown if shift => app.agent_scroll = app.agent_scroll.saturating_sub(5),
+        KeyCode::PageUp => app.agent_scroll += if shift { 2 } else { 10 },
+        KeyCode::PageDown => app.agent_scroll = app.agent_scroll.saturating_sub(if shift { 2 } else { 10 }),
         KeyCode::Tab => app.expand_tools = !app.expand_tools,
         KeyCode::Up => {
             if !app.history.is_empty() && app.hist_pos > 0 {
@@ -1114,4 +1374,31 @@ fn handle_agent_key(app: &mut App, k: &event::KeyEvent) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_paste;
+
+    #[test]
+    fn paste_normalizes_newlines_and_tabs() {
+        let (clean, dropped) = sanitize_paste("a\r\nb\rc\td");
+        assert_eq!(clean, "a\nb\nc    d");
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn paste_strips_escape_and_control_sequences() {
+        let (clean, dropped) = sanitize_paste("ok\x1b]0;pwned\x07line\x00end");
+        assert_eq!(clean, "ok]0;pwnedlineend");
+        assert!(dropped > 0);
+    }
+
+    #[test]
+    fn paste_is_capped_with_visible_drop_count() {
+        let big = "x".repeat(super::MAX_PASTE_BYTES + 1234);
+        let (clean, dropped) = sanitize_paste(&big);
+        assert_eq!(clean.len(), super::MAX_PASTE_BYTES);
+        assert_eq!(dropped, 1234);
+    }
 }

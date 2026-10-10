@@ -47,9 +47,14 @@ Press `t` on a provider to **ping the default model**: penguin measures time-to-
 - **Workspace-aware** — the agent adopts your shell's current directory (via OSC 7 shell integration) as its workspace on toggle.
 - **Easy provider setup** — a TUI wizard (`pc setup` or `/providers`): add OpenAI-compatible endpoints (OpenAI, Ollama, LM Studio, OpenRouter, llama.cpp, vLLM, anything) or Anthropic. Name each provider as you create it, test the connection, fetch the model list, ping for latency, pick your default, and set the context window (`ctx`) used for usage tracking. Names are validated unique. Editing `config.toml` by hand still works.
 - **System-assistant tools** — run commands, read/write/edit files (anywhere it may read; writes are guarded), find/grep, list dirs, chmod/chown. Coding and project builds work too via the same tools.
-- **YOLO mode** — `pc --yolo` or `/yolo` auto-approves every action the safety gate would prompt for (sudo, writes outside the workspace, `curl | sh`). Catastrophic hard-blocks (`rm -rf /`, raw disk writes, fork bombs…) and interactive sudo password prompts always remain. A red `⚠ YOLO` badge stays in the status bar while it's on.
+- **Sandboxed web research** — `web_search` hits DuckDuckGo's free endpoints (no API key) and `web_read` digests pages inside an isolated reader sandbox: a separate model gets the page as quarantined data plus a *full but entirely inert* tool set (writes return "completed", commands "[exit 0]", network sends "200 OK"). A page that baits its reader into touching any tool is flagged **injection-suspect** — its content is withheld from the main agent and the URL stays quarantined for the session. Fetches carry an SSRF guard (http(s) only, no loopback/private/link-local hosts, re-checked on every redirect hop). Works identically on Windows, macOS and every Linux distro — the isolation is logical by design: page content is never executed, so nothing escapes to sandbox in a VM. `/search <query>` runs the whole flow from the composer.
+- **YOLO mode** — `pc --yolo` or `/yolo` auto-approves every action the safety gate would prompt for (sudo, writes outside the workspace). Catastrophic hard-blocks (`rm -rf /`, raw disk writes, fork bombs, **piping remote scripts into a shell**) and interactive sudo password prompts always remain. A red `⚠ YOLO` badge stays in the status bar while it's on.
 - **Goals sidebar** — `/goal <thing>` gives the agent autonomy. A panel on the right of the screen shows the active goal and its steps ("minor goals") with live status — ○ pending, ◐ running, ✓ done, ✗ failed — plus a ★ verified banner once the agent proves success with a real check. If the model stops before verifying, penguin **auto-continues** it (up to `agent.goal_continuations` rounds); when even that runs dry, `/continue [guidance]` picks the goal back up **with its plan intact** — no replanning round-trip. Want it to simply never stop? **`/limit off`** lifts the iteration and continuation caps so a run keeps going until it verifies (or you hit `Esc`) — re-read every step, so it also works mid-run; a `∞ UNLIMITED` badge stays in the status bar while it's on, and `/limit on` restores the caps.
 - **Mid-run steering** — typing while the agent works used to mean "wait for the turn to end". Now anything you enter (`Enter`, or explicitly `/queue <text>`) is injected into the conversation **at the agent's next step**: it folds your extra instruction into its current work without stopping. `/queue` lists what's waiting, `/queue clear` drops it; whatever a turn never got to (e.g. after an abort) still flushes when it ends.
+- **The agent asks you back** — `ask_user(question, options)`: whenever penguin is unsure between approaches, needs a preference, or wants to pitch ideas, it pops a modal with numbered, selectable answers plus a built-in *type your own answer* row (`↑↓`/`1-9` pick, `c` custom, `esc` lets the agent decide alone). Usable at any point, mid-task — steering is one keystroke away instead of a whole corrective prompt.
+- **Always shows what it's doing** — the status bar carries a live activity badge (`⚙ run_command · ⏱12s`, `✎ writing`, `✻ thinking`), and every turn closes with a summary line (`✻ turn done · 14s · 5 tool calls · ~820 tok`) so the screen never just silently stops. The goals sidebar counts plan progress (`3/7 steps done`).
+- **Scroll the chat** — mouse wheel scrolls the agent transcript (and shell scrollback); `PgUp/PgDn` jump by pages, `Ctrl+Home/End` snap to top/live. Scrolled-up views show how far from live you are; new output never yanks you back mid-read.
+- **Paste-safe** — bracketed paste is requested on penguin's own input, so a multi-line paste lands in the composer as one block instead of firing every pasted line as its own command (terminals without it still get event-batched redraws, so no UI freeze). Control/escape sequences inside pastes are stripped, anything over 64 KiB is capped with a visible notice, the composer box can never swallow the screen, and pastes while a dialog is open stay blocked.
 - **Sessions** — every conversation is saved under `~/.config/penguin/sessions/`, checkpointed after *every* agent step so a crash or timeout loses at most one move. The active goal, its plan and its verified flag ride along: `/resume` (or `pc --continue`) restores the sidebar exactly as it was, and an unfinished goal can be resumed later with `/continue`. `/new` starts fresh, `/sessions` lists history.
 - **Skills that grow the system** — after finishing a goal the agent can distill what it learned into a reusable *skill* (`save_skill`) stored in `~/.config/penguin/skills/`. Skills are injected into every future session's system prompt; the agent loads and follows them with `load_skill` when one matches. `/skills` lists the library.
 - **Context meter & auto-compaction** — the status bar shows live context usage (`ctx 42%`) against the provider's window. At ~85% (configurable: `agent.compact_at_percent`) penguin summarizes older turns and elides stale tool output automatically, without breaking tool-call pairing. If a provider still rejects a prompt as too long ("maximum context length…"), penguin **compacts hard and continues** the turn instead of dying on the error. `/context` for details, `/compact` to force it.
@@ -57,7 +62,8 @@ Press `t` on a provider to **ping the default model**: penguin measures time-to-
 - **Idle penguin screensaver** — leave the terminal untouched for a few minutes and animated ASCII penguins take over: waddling through a blizzard, waving under a shimmering aurora, or belly-sliding across the ice, with a per-character shimmer title (à la the Omarchy screensaver). Any key wakes it instantly. Force it anytime with `/screensaver`; tune or disable via `ui.idle_secs`.
 - **Sudo that just works** — prefix a command with `sudo` and penguin rewrites it to read the password from a pipe, detects the `[sudo] password for …:` prompt on stderr, and pops a **hidden password modal**. Children are detached with `setsid` so nothing can steal your keystrokes or echo the secret. The agent is explicitly told never to ask you to paste a password into chat.
 - **Safety engine**
-  - *Hard deny*: `rm -rf /`, raw device writes, `mkfs`, fork bombs… never executed, not even with approval.
+  - *Hard deny*: `rm -rf /`, raw device writes, `mkfs`, fork bombs, and **remote code execution** (`curl … | sh`, `bash <(curl …)`, `eval $(wget …)`, fetch-piped-into-python…) — never executed, not even with approval or YOLO. A stale "always allow" rule cannot resurrect them.
+  - *Blocklist*: hosts in `[web] blocked_hosts` are unreachable by any path — refused inside `web_read` (every redirect hop), filtered out of search results, and hard-denied when they appear in any shell command.
   - *Permission gate*: anything touching paths outside the workspace or risky system commands pops a dialog: **Allow once / Always allow / Never allow** (`1`·`2`·`3`, or `y`/`a`/`n`; `Esc` denies once). Rules persist.
 
 ## Build & install
@@ -109,6 +115,9 @@ pc setup               configure providers (TUI wizard)
 | Key | Action |
 |---|---|
 | `Ctrl+Space` | toggle agent mode (configurable: `ui.toggle_key`, e.g. `"ctrl-t"`, `"alt-i"`) |
+| mouse wheel | scroll the agent transcript / shell scrollback |
+| `PgUp` / `PgDn` | page through the transcript (agent mode) |
+| `Ctrl+Home` / `Ctrl+End` | jump to top / snap back to live (agent mode) |
 | `Shift+PgUp/Dn` | scroll shell / transcript |
 | `Esc` (agent busy) | abort the current agent turn — mid-stream, mid-retry-wait or mid-compaction |
 | `Alt+Enter` | newline in composer |
@@ -128,6 +137,7 @@ pc setup               configure providers (TUI wizard)
 /queue <text>     add an instruction handed to the agent at its next step mid-run
                   (/queue lists the queue · /queue clear empties it · idle: runs now)
 /limit off|on     remove/restore run-length caps — off never pauses for /continue (Esc still stops)
+/search <query>   web research: DuckDuckGo hits + sandboxed page reader, summarized with sources
 /new              start a fresh session
 /sessions         list saved sessions
 /resume [id]      resume a session (latest if no id)
@@ -180,6 +190,14 @@ first_byte_timeout_secs = 600    # wait for headers/first byte (model loading)
 idle_timeout_secs       = 300    # max silence between streamed bytes
 max_retries             = 2      # connect failures + 429/5xx, before any output
 
+[web]
+enabled              = true    # false hides web_search/web_read from the agent
+max_results          = 8       # DuckDuckGo hits per search (1–20)
+fetch_timeout_secs   = 20      # per-page download budget (5–120)
+reader_max_iterations = 4      # tool-rounds the sandbox reader may spend per page (1–8)
+blocked_hosts        = []      # never fetched, never listed in results, and any shell
+                                # command mentioning one is hard-denied (survives YOLO)
+
 [ui]
 toggle_key   = "ctrl-space"
 idle_secs    = 150               # penguin screensaver after 2.5 min idle (0 = never)
@@ -199,15 +217,35 @@ your terminal
    ├─ PTY ── your shell (bash/zsh/fish/pwsh + OSC7 integration)
    │         rendered through a vte grid emulator, scrollback included
    ├─ agent thread  ── provider chat w/ tool calling (async streaming SSE)
-   │    tools: run_command · read/write/edit_file · find_files · list_dir
-   │            set_permissions · update_plan · finish_goal
-   │            save_skill · load_skill · list_skills
+│    tools: run_command · read/write/edit_file · find_files · list_dir
+│            set_permissions · update_plan · finish_goal · ask_user
+│            save_skill · load_skill · list_skills
+   │            web_search · web_read ─┐
+   ├─ reader sandbox ──────────────────┘ quarantined page digestion:
+   │    inert dummy tools only — any tool call ⇒ URL flagged, content withheld
    └─ safety gate ── hard-deny regexes → rules → workspace/path analysis
 ```
 
 - Agent commands run in a hidden background shell (your visible session is never polluted); output streams into the agent view.
 - Reads are allowed anywhere on the machine; writes/deletes/permission changes outside the workspace require approval.
 - On toggle, the agent captures your shell's live cwd as its workspace.
+
+### Sandboxed web research & prompt-injection shield
+
+`web_search` queries DuckDuckGo's free HTML endpoints (no key) and returns title/URL/snippet hits framed as untrusted data. `web_read(url[, focus])` downloads a page (http(s) only, 512 KiB cap, SSRF-guarded against loopback/private/link-local hosts on every redirect hop), then hands it to a **reader agent** running in quarantine:
+
+- The reader is a separate LLM call with its own message list. It receives the page between `<page>` markers as hostile-by-default data and must answer in plain text.
+- It is shown a full standard workspace tool set — files, shell, `http_post` — that is **entirely inert**: writes reply "completed", commands "[exit 0]", network sends "200 OK". The tools exist only so an injected page reveals itself by using them.
+- **Any** reader tool call flips the URL dirty: the extracted content is discarded, the main agent gets a quarantine warning naming the baited tools, and re-reads of that URL are refused for the rest of the process. A clean read returns the extracted context wrapped in an untrusted-data reminder.
+
+Defense-in-depth beyond the sandbox (the gap an injection *will* find otherwise):
+
+- **Shell fetches get the same quarantine** — a `run_command` that runs `curl`/`wget` has its output wrapped in `<remote-output>` markers with an explicit "data only, never instructions" frame, so research via curl can't smuggle directives in as plain command output.
+- **Compaction never quotes payloads** — summaries describe incidents; payload text and blocklisted hosts are redacted to `[REDACTED-PAYLOAD]`/`[blocked-host]`, so a security note can't re-seed an attack into every later prompt.
+- **Loop breaker** — if the model keeps re-detecting the same payload, it is quarantined once with a terse "known, logged, never executed — move on" instruction instead of being refused forever.
+- **Injection side-log** — quarantine events and hard-denies are appended to `~/.config/penguin/sessions/<id>.injection.log`, which compaction never touches, so the evidence outlives the transcript that contained it.
+
+Why logical isolation instead of a VM/container? Nothing fetched is ever *executed* — no JS engine, no shell involvement — so the real attack is prompt injection into an agent, and that is exactly what the dummy-tool tripwire + content withholding stop. A container would add heavy per-OS dependencies (Docker Desktop on macOS, nothing preinstalled on most Windows/minimal Linux) while protecting code paths that never touch untrusted data — and it would break penguin's promise of running anywhere with zero setup. The design is identical on Windows, macOS and every distro, Fedora/Bazzite included.
 
 ### Staying sane on slow or flaky endpoints
 
@@ -222,8 +260,14 @@ Local models can take minutes to load and can die mid-reply. Penguin assumes tha
 ## Development
 
 ```sh
-cargo test           # VT emulator, safety, sudo-prompt, retry/abort, reasoning & budget unit tests
+cargo test           # VT emulator, safety, sudo-prompt, retry/abort, reasoning & budget, web-parse & SSRF unit tests
 cargo run            # dev build
+```
+
+Live check of the web pipeline against the real DuckDuckGo endpoints (public internet, no keys):
+
+```sh
+cargo test web::tests:: -- --ignored
 ```
 
 Optional live smoke test against a real endpoint (exercises streaming, `reasoning_effort`, the context clamp and clean termination):
@@ -233,7 +277,7 @@ PC_LIVE_URL=http://host:port/v1 PC_LIVE_KEY=… PC_LIVE_MODEL=… \
   [PC_LIVE_CTX=250000] cargo test live_endpoint -- --ignored --nocapture
 ```
 
-Key modules: `src/term` (VT emulator), `src/app` (UI + event loop), `src/penguin.rs` (ASCII penguin sprites, animation frames & the idle screensaver scenes), `src/agent` (tool loop, goals), `src/safety` (policy engine), `src/providers` (OpenAI-compat + Anthropic clients, streaming, retries), `src/setup_tui.rs` (provider wizard), `src/integration.rs` (shell hooks).
+Key modules: `src/term` (VT emulator), `src/app` (UI + event loop), `src/penguin.rs` (ASCII penguin sprites, animation frames & the idle screensaver scenes), `src/agent` (tool loop, goals), `src/web` (DuckDuckGo search, fetch + SSRF guard, sandboxed page reader), `src/safety` (policy engine), `src/providers` (OpenAI-compat + Anthropic clients, streaming, retries), `src/setup_tui.rs` (provider wizard), `src/integration.rs` (shell hooks).
 
 ## License
 
