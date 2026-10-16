@@ -72,12 +72,22 @@ pub struct QuestionModal {
     pub buf: String,
 }
 
+/// Rows shown per page in the session picker before it paginates.
+pub const PICKER_PAGE: usize = 12;
+
+/// Interactive `/sessions` menu: pick a saved session with ↑↓ and resume it
+/// with Enter; Esc closes it and returns to where you were.
+pub struct SessionPicker {
+    pub sessions: Vec<crate::session::Session>,
+    pub sel: usize,
+}
+
 pub struct Options {
     pub shell: Option<String>,
     pub workspace: Option<PathBuf>,
     pub prompt: Option<String>,
     pub cont_last: bool,
-    pub yolo: bool,
+    pub ultra: bool,
 }
 
 pub struct App {
@@ -105,6 +115,8 @@ pub struct App {
     pub permission: Option<PermModal>,
     pub secret: Option<SecretModal>,
     pub question: Option<QuestionModal>,
+    /// Open `/sessions` menu (when Some): a keyboard-selectable session list.
+    pub sessions: Option<SessionPicker>,
     pub scroll: usize,
     pub agent_scroll: usize,
     pub tick: u32,
@@ -116,7 +128,23 @@ pub struct App {
     pub ctx_used: usize,
     pub ctx_window: usize,
     pub screensaving: bool,
+    /// Current screensaver pool entry (scenes + wordmark effects).
     pub saver_scene: usize,
+    /// Tick the current screensaver entry started on (drives reveal anims).
+    pub saver_start: u32,
+    /// Inverse-frequency picker so entries rotate without repeats (omarchy-style).
+    saver_picker: crate::penguin::EffectPicker,
+    /// Shared MCP registry (also lives inside AgentEnv for the agent thread).
+    mcp: Arc<Mutex<crate::mcp::Registry>>,
+    /// Candidates from the last `/mcp import` scan, for `/mcp import 1,3`.
+    mcp_import_cache: Vec<crate::mcp::importer::Candidate>,
+    /// Skills loaded via `load_skill` during this session (insertion order),
+    /// shown live in the left panel.
+    pub active_skills: Vec<String>,
+    /// One-time nudge for an ssh session detected in the shell pane.
+    ssh_hinted: bool,
+    /// Pid of the shell process running inside the PTY (ssh detection root).
+    shell_pid: u32,
     last_input: std::time::Instant,
     /// When the current busy turn began (for the elapsed timer).
     pub busy_since: std::time::Instant,
@@ -202,16 +230,19 @@ impl App {
         let rest = it.next().unwrap_or("").trim();
         match cmd {
             "" => {}
-            "help" => self.transcript.push(Entry::Info(
-                "/goal <text> autonomous plan+execute+verify · /continue [note] resume the unfinished goal · \
+            "help" => self.transcript.push(Entry::Info(format!(
+                "🐧 penguin command v{} — /goal <text> autonomous plan+execute+verify · \
+                 /continue [note] resume the unfinished goal · \
                  /queue <text> add instructions mid-run (/queue lists, /queue clear) · \
                  /limit off|on remove/restore run-length caps · \
                  /search <q> web search (sandboxed page reader) · \
-                 /new fresh session · /sessions list · /resume [id] · /skills list saved skills · \
+                  /new fresh session · /sessions pick from a menu · /resume [id] · /skills list saved skills · \
                  /compact compact context now · /retry resend last prompt · /effort cycle reasoning depth · \
-                 /context usage · /yolo bypass approvals (dangerous) · /providers setup UI · /model [name] · \
-                 /workspace <dir> · /screensaver · /clear · /quit".into(),
-            )),
+                 /context usage · /ultra bypass approvals (dangerous) · /providers setup UI · /model [name] · \
+                 /workspace <dir> · /ssh attach|detach|status ride the active ssh session · \
+                 /mcp MCP servers (status/add/import) · /screensaver · /clear · /quit",
+                env!("CARGO_PKG_VERSION")
+            ))),
             "quit" | "exit" => self.running = false,
             "clear" => {
                 self.transcript.clear();
@@ -324,17 +355,8 @@ impl App {
                 if list.is_empty() {
                     self.transcript.push(Entry::Info("no saved sessions yet".into()));
                 } else {
-                    for s in list.iter().take(10) {
-                        self.transcript.push(Entry::Info(format!(
-                            "{} · {} · {} · {} msgs · “{}”",
-                            s.id,
-                            session::fmt_ts(s.updated_ms),
-                            if s.model.is_empty() { "—" } else { &s.model },
-                            s.messages.len(),
-                            s.title,
-                        )));
-                    }
-                    self.transcript.push(Entry::Info("/resume <id> — no id resumes the latest".into()));
+                    // Interactive menu: ↑↓ to pick, Enter resumes, Esc backs out.
+                    self.sessions = Some(SessionPicker { sessions: list, sel: 0 });
                 }
             }
             "resume" => {
@@ -356,8 +378,15 @@ impl App {
                 if skills.is_empty() {
                     self.transcript.push(Entry::Info("skill library is empty — the agent fills it after finishing goals".into()));
                 } else {
-                    for sk in skills {
-                        self.transcript.push(Entry::Info(format!("◆ {}: {}", sk.name, sk.description)));
+                    for sk in &skills {
+                        let used = if sk.use_count > 0 { format!(" · used {}×", sk.use_count) } else { String::new() };
+                        self.transcript.push(Entry::Info(format!(
+                            "◆ {}: {} (updated {}{})",
+                            sk.name,
+                            sk.description,
+                            session::fmt_ts(sk.updated_ms.max(sk.created_ms)),
+                            used
+                        )));
                     }
                 }
             }
@@ -417,24 +446,24 @@ impl App {
                     if rest.is_empty() { " — /effort again for the next level" } else { "" }
                 )));
             }
-            "yolo" => {
+            "ultra" => {
                 let on = match rest.to_lowercase().as_str() {
                     "" | "on" => true,
                     "off" => false,
                     _ => {
-                        self.transcript.push(Entry::Error("usage: /yolo [on|off]".into()));
+                        self.transcript.push(Entry::Error("usage: /ultra [on|off]".into()));
                         return Ok(());
                     }
                 };
-                self.env.lock().unwrap().yolo = on;
-                self.cfg.agent.yolo = on;
+                self.env.lock().unwrap().ultra = on;
+                self.cfg.agent.ultra = on;
                 if on {
                     self.transcript.push(Entry::Info(
-                        "⚠ YOLO ON — approvals are bypassed for this session. Catastrophic hard-blocks \
-                         and sudo password prompts still apply. /yolo off to restore them.".into(),
+                        "⚠ ULTRA ON — approvals are bypassed for this session. Catastrophic hard-blocks \
+                         and sudo password prompts still apply. /ultra off to restore them.".into(),
                     ));
                 } else {
-                    self.transcript.push(Entry::Info("✦ yolo off — approval dialogs restored".into()));
+                    self.transcript.push(Entry::Info("✦ ultra off — approval dialogs restored".into()));
                 }
             }
             "model" => {
@@ -462,6 +491,7 @@ impl App {
                     self.transcript.push(Entry::Error("no provider configured — /providers".into()));
                 }
             }
+            "ssh" => self.cmd_ssh(rest),
             "workspace" | "ws" => {
                 if rest.is_empty() {
                     self.transcript.push(Entry::Info(format!("workspace: {}", self.workspace.display())));
@@ -478,6 +508,7 @@ impl App {
                 }
             }
             "screensaver" | "saver" => self.force_screensave(),
+            "mcp" => self.cmd_mcp(rest),
             other => self.transcript.push(Entry::Error(format!("unknown command /{other} — try /help"))),
         }
         Ok(())
@@ -588,6 +619,17 @@ impl App {
                     self.streaming.clear();
                     self.reasoning.clear();
                     self.activity = Some(name.clone());
+                    if name == "load_skill" {
+                        // remember it for the left panel's active-skills list
+                        if let Some(s) = serde_json::from_str::<serde_json::Value>(&args)
+                            .ok()
+                            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
+                        {
+                            if !self.active_skills.contains(&s) {
+                                self.active_skills.push(s);
+                            }
+                        }
+                    }
                     self.transcript.push(Entry::Tool {
                         name,
                         args,
@@ -710,21 +752,303 @@ impl App {
     }
 
     /// Omarchy-style idle screensaver: after [ui] idle_secs without input,
-    /// animated penguins take over the viewport until any key is pressed.
+    /// penguins and wordmark effects take over the viewport until any key is
+    /// pressed. While running, entries auto-rotate on their own schedule.
     fn maybe_screensave(&mut self) {
-        if self.screensaving || self.busy || self.permission.is_some() || self.secret.is_some() || self.question.is_some() {
+        if self.screensaving {
+            let dur = crate::penguin::entry_duration(self.saver_scene);
+            if self.tick.wrapping_sub(self.saver_start) >= dur {
+                self.saver_scene = self.saver_picker.pick();
+                self.saver_start = self.tick;
+            }
+            return;
+        }
+        if self.busy || self.permission.is_some() || self.secret.is_some() || self.question.is_some() || self.sessions.is_some() {
             return;
         }
         let idle = self.cfg.ui.idle_secs.unwrap_or(150);
         if idle > 0 && self.last_input.elapsed() >= std::time::Duration::from_secs(idle) {
-            self.saver_scene = crate::penguin::pick_scene(self.tick as u64 ^ (std::process::id() as u64) << 17);
+            self.saver_scene = self.saver_picker.pick();
+            self.saver_start = self.tick;
             self.screensaving = true;
         }
     }
 
     pub fn force_screensave(&mut self) {
-        self.saver_scene = crate::penguin::pick_scene(self.tick as u64 ^ 0x5EED);
+        self.saver_scene = self.saver_picker.pick();
+        self.saver_start = self.tick;
         self.screensaving = true;
+    }
+
+    /// Persist the [mcp] config and realign live connections with it.
+    fn mcp_apply_config(&mut self) {
+        let _ = self.cfg.save();
+        let notes: Vec<String> = self.mcp.lock().unwrap().sync_config(&self.cfg.mcp.servers);
+        for n in notes {
+            self.transcript.push(Entry::Info(format!("mcp · {n}")));
+        }
+    }
+
+    /// `/mcp` — status, add/remove/enable/trust servers, list tools,
+    /// reconnect, and import from other coding agents' configs.
+    /// `/ssh [status|attach [user@host] [path]|detach]` — ride along with the
+    /// `ssh` session open in the shell pane: the agent connects to that same
+    /// computer and makes the terminal's folder its workspace. Commands and
+    /// file tools then run remotely over a fresh BatchMode ssh channel.
+    fn cmd_ssh(&mut self, rest: &str) {
+        let mut it = rest.splitn(3, ' ');
+        let sub = it.next().unwrap_or("");
+        match sub {
+            "" | "status" => {
+                let attached = self.env.lock().unwrap().remote.clone();
+                if let Some(rm) = attached {
+                    self.transcript.push(Entry::Info(format!(
+                        "🔌 riding along at {}:{} — /ssh detach to go back local",
+                        rm.host, rm.path
+                    )));
+                } else {
+                    match crate::ssh::detect_target(self.shell_pid) {
+                        Some(t) => self.transcript.push(Entry::Info(format!(
+                            "ssh session to {t} detected in your shell — /ssh attach to ride along with it"
+                        ))),
+                        None => self.transcript.push(Entry::Info(
+                            "no ssh session detected in the shell pane. Open one (ssh user@host), then /ssh attach.\n\
+                             usage: /ssh attach [user@host] [remote-path] · /ssh detach".into(),
+                        )),
+                    }
+                }
+            }
+            "attach" => {
+                if self.busy {
+                    self.transcript.push(Entry::Error("agent is working — esc first, then /ssh attach".into()));
+                    return;
+                }
+                let arg1 = it.next().unwrap_or("").trim();
+                let path_arg = it.next().unwrap_or("").trim();
+                let target = if !arg1.is_empty() && !arg1.starts_with('/') {
+                    Some(arg1.to_string())
+                } else {
+                    crate::ssh::detect_target(self.shell_pid)
+                };
+                let path = if arg1.starts_with('/') { Some(arg1) } else if !path_arg.is_empty() { Some(path_arg) } else { None };
+                match target {
+                    None => self.transcript.push(Entry::Error(
+                        "no ssh session detected — usage: /ssh attach [user@host] [remote-path]".into(),
+                    )),
+                    Some(t) => match crate::ssh::probe(&t, path) {
+                        Ok(rm) => {
+                            let label = format!("{}:{}", rm.host, rm.path);
+                            let mut e = self.env.lock().unwrap();
+                            e.workspace = std::path::PathBuf::from(&rm.path);
+                            e.remote = Some(rm);
+                            drop(e);
+                            self.transcript.push(Entry::Info(format!(
+                                "🔌 attached — workspace is now {label}; commands & file tools run there. /ssh detach to go back."
+                            )));
+                        }
+                        Err(err) => self.transcript.push(Entry::Error(format!("attach failed: {err}"))),
+                    },
+                }
+            }
+            "detach" => {
+                let mut e = self.env.lock().unwrap();
+                if e.remote.take().is_some() {
+                    e.workspace = self.workspace.clone();
+                    self.transcript.push(Entry::Info(format!("workspace back to local {}", self.workspace.display())));
+                } else {
+                    self.transcript.push(Entry::Info("not attached".into()));
+                }
+            }
+            other => self.transcript.push(Entry::Error(format!(
+                "unknown /ssh subcommand '{other}' — use: /ssh status | attach [user@host] [path] | detach"
+            ))),
+        }
+    }
+
+    fn cmd_mcp(&mut self, rest: &str) {
+        let (sub, arg) = match rest.split_once(char::is_whitespace) {
+            Some((a, b)) => (a, b.trim()),
+            None => (rest, ""),
+        };
+        let usage = "usage: /mcp · /mcp tools [server] · /mcp add <name> -- <command args… | url> · \
+                     /mcp remove|trust|untrust|enable|disable <name> · /mcp reconnect [name|all] · \
+                     /mcp import [--all | 1,3]";
+        let find_idx = |app: &Self, name: &str| -> Option<usize> {
+            app.cfg.mcp.servers.iter().position(|s| s.name == name)
+        };
+        match sub {
+            "" | "status" | "list" => {
+                let lines = self.mcp.lock().unwrap().status_lines();
+                if lines.is_empty() {
+                    self.transcript.push(Entry::Info(
+                        "no MCP servers configured — add one with `/mcp add <name> -- npx -y \
+                         @modelcontextprotocol/server-filesystem .` or import from another agent \
+                         with `/mcp import`. Ask the setup-mcp skill for guided help.".into(),
+                    ));
+                } else {
+                    for l in lines {
+                        self.transcript.push(Entry::Info(format!("mcp · {l}")));
+                    }
+                    self.transcript.push(Entry::Info(usage.into()));
+                }
+            }
+            "tools" => {
+                let reg = self.mcp.lock().unwrap();
+                let names: Vec<String> = if arg.is_empty() {
+                    reg.server_names()
+                } else {
+                    vec![arg.to_string()]
+                };
+                for n in names {
+                    let tools = reg.tools_of(&n);
+                    if tools.is_empty() {
+                        self.transcript.push(Entry::Info(format!("mcp · {n}: no tools cached ({}) — /mcp reconnect {n}", reg.state_of(&n))));
+                    } else {
+                        for t in tools {
+                            self.transcript.push(Entry::Info(format!("mcp · {} · {}", t.exposed, crate::providers::truncate(&t.description, 90))))
+                        }
+                    }
+                }
+            }
+            "add" => {
+                let Some((name, target)) = arg.split_once("--").map(|(n, t)| (crate::mcp::importer::sanitize_name(n.trim()), t.trim().to_string())) else {
+                    self.transcript.push(Entry::Error(usage.into()));
+                    return;
+                };
+                if name.is_empty() || target.is_empty() {
+                    self.transcript.push(Entry::Error(usage.into()));
+                    return;
+                }
+                if find_idx(self, &name).is_some() {
+                    self.transcript.push(Entry::Error(format!("mcp · a server named '{name}' already exists")));
+                    return;
+                }
+                let mut sc = crate::config::McpServerConfig {
+                    name: name.clone(),
+                    command: String::new(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    url: None,
+                    headers: Default::default(),
+                    enabled: true,
+                    trust: false,
+                    timeout_secs: None,
+                };
+                if target.starts_with("http://") || target.starts_with("https://") {
+                    sc.url = Some(target.clone());
+                } else {
+                    let toks = crate::safety::tokenize(&target);
+                    if toks.is_empty() {
+                        self.transcript.push(Entry::Error("nothing to run".into()));
+                        return;
+                    }
+                    sc.command = toks[0].clone();
+                    sc.args = toks[1..].to_vec();
+                }
+                self.cfg.mcp.servers.push(sc);
+                self.mcp_apply_config();
+                // Immediate feedback: probe with a bounded timeout.
+                match self.mcp.lock().unwrap().probe(&name, std::time::Duration::from_secs(20)) {
+                    Ok(n) => self.transcript.push(Entry::Info(format!("✓ mcp '{name}' connected · {n} tools exposed as mcp__{name}__* (approval-gated; /mcp trust {name} to skip)"))),
+                    Err(e) => self.transcript.push(Entry::Info(format!("mcp '{name}' saved, but the test connection failed: {e}\nfix it and run /mcp reconnect {name} — the agent will retry it automatically next turn."))),
+                }
+            }
+            "remove" | "rm" => {
+                if arg.is_empty() || find_idx(self, arg).is_none() {
+                    self.transcript.push(Entry::Error(format!("no mcp server named '{arg}'")));
+                    return;
+                }
+                self.cfg.mcp.servers.retain(|s| s.name != arg);
+                self.mcp_apply_config();
+                self.transcript.push(Entry::Info(format!("mcp · removed '{arg}' (saved)")));
+            }
+            "trust" | "untrust" => {
+                let trust = sub == "trust";
+                match find_idx(self, arg) {
+                    Some(i) => {
+                        self.cfg.mcp.servers[i].trust = trust;
+                        self.mcp_apply_config();
+                        self.transcript.push(Entry::Info(format!(
+                            "mcp · '{arg}' → {} — calls now {}",
+                            if trust { "trusted" } else { "ask" },
+                            if trust { "run without approval" } else { "require approval (per-tool \"always allow\" still works)" }
+                        )));
+                    }
+                    None => self.transcript.push(Entry::Error(format!("no mcp server named '{arg}'"))),
+                }
+            }
+            "enable" | "disable" => {
+                let on = sub == "enable";
+                match find_idx(self, arg) {
+                    Some(i) => {
+                        self.cfg.mcp.servers[i].enabled = on;
+                        self.mcp_apply_config();
+                        self.transcript.push(Entry::Info(format!("mcp · '{arg}' {}", if on { "enabled" } else { "disabled" })));
+                    }
+                    None => self.transcript.push(Entry::Error(format!("no mcp server named '{arg}'"))),
+                }
+            }
+            "reconnect" => {
+                let names: Vec<String> = if arg.is_empty() || arg == "all" {
+                    self.cfg.mcp.servers.iter().filter(|s| s.enabled).map(|s| s.name.clone()).collect()
+                } else {
+                    vec![arg.to_string()]
+                };
+                for n in names {
+                    match self.mcp.lock().unwrap().reconnect(&n) {
+                        Ok(t) => self.transcript.push(Entry::Info(format!("✓ mcp '{n}' reconnected · {t} tools"))),
+                        Err(e) => self.transcript.push(Entry::Error(format!("mcp '{n}': {e}"))),
+                    }
+                }
+            }
+            "import" => {
+                if arg.is_empty() {
+                    let found = crate::mcp::importer::discover(&self.workspace);
+                    self.mcp_import_cache = found.clone();
+                    if found.is_empty() {
+                        self.transcript.push(Entry::Info("no MCP servers found in other agents' configs (checked Claude Desktop/Code, opencode, Codex CLI, Gemini CLI, Cursor)".into()));
+                    } else {
+                        for (i, c) in found.iter().enumerate() {
+                            let target = if c.cfg.is_http() { c.cfg.url.clone().unwrap_or_default() } else { format!("{} {}", c.cfg.command, c.cfg.args.join(" ")) };
+                            let dup = find_idx(self, &c.cfg.name).is_some();
+                            self.transcript.push(Entry::Info(format!(
+                                "  {} [{}] {}{target}",
+                                i + 1,
+                                c.source,
+                                if dup { "(name already configured — will be skipped) " } else { "" }
+                            )));
+                        }
+                        self.transcript.push(Entry::Info("add with /mcp import 1,3 (or --all for everything)".into()));
+                    }
+                    return;
+                }
+                let picks: Vec<usize> = if arg == "--all" {
+                    (0..self.mcp_import_cache.len()).collect()
+                } else {
+                    arg.split([',', ' ']).filter_map(|p| p.trim().parse::<usize>().ok()).map(|n| n.saturating_sub(1)).filter(|n| *n < self.mcp_import_cache.len()).collect()
+                };
+                if picks.is_empty() {
+                    self.transcript.push(Entry::Error("usage: /mcp import 1,3 · /mcp import --all (run bare /mcp import to scan first)".into()));
+                    return;
+                }
+                let mut added = 0usize;
+                for p in picks {
+                    let c = self.mcp_import_cache[p].clone();
+                    if find_idx(self, &c.cfg.name).is_some() {
+                        continue;
+                    }
+                    self.cfg.mcp.servers.push(c.cfg);
+                    added += 1;
+                }
+                if added == 0 {
+                    self.transcript.push(Entry::Info("nothing imported (all picked names already exist)".into()));
+                    return;
+                }
+                self.mcp_apply_config();
+                self.transcript.push(Entry::Info(format!("imported {added} server(s) from other agents — run /mcp to see their status")));
+            }
+            _ => self.transcript.push(Entry::Error(usage.into())),
+        }
     }
 
     /// Unified window: the agent shares the full viewport with the shell,
@@ -743,18 +1067,53 @@ impl App {
         }
         if mode == Mode::Agent {
             let ws = self.emu.lock().unwrap().term.cwd.clone();
-            if let Some(mut w) = ws {
-                while !w.is_dir() {
-                    if !w.pop() {
-                        break;
+            let mut e = self.env.lock().unwrap();
+            if e.remote.is_some() {
+                // Attached to an ssh session: the terminal's folder *is* on
+                // the remote host — keep riding along with it (the remote
+                // shell's OSC 7 lands here as a path we can't stat locally).
+                let newpath: Option<std::path::PathBuf> = ws.and_then(|w| {
+                    let p = w.display().to_string();
+                    if p.starts_with('/') && e.remote.as_ref().map(|r| r.path != p).unwrap_or(false) {
+                        Some(w)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(p) = newpath {
+                    let label = {
+                        let rm = e.remote.as_mut().unwrap();
+                        rm.path = p.display().to_string();
+                        format!("{}:{}", rm.host, rm.path)
+                    };
+                    e.workspace = p;
+                    self.transcript.push(Entry::Info(format!("🔌 riding along at {label}")));
+                }
+            } else {
+                drop(e);
+                if let Some(mut w) = ws {
+                    while !w.is_dir() {
+                        if !w.pop() {
+                            break;
+                        }
+                    }
+                    if w.is_dir() {
+                        self.workspace = w;
                     }
                 }
-                if w.is_dir() {
-                    self.workspace = w;
+                self.env.lock().unwrap().workspace = self.workspace.clone();
+                self.transcript.push(Entry::Info(format!("agent mode · workspace: {}", self.workspace.display())));
+                // offer the ride-along once per session when an ssh client
+                // is live under the shell pane
+                if !self.ssh_hinted {
+                    if let Some(t) = crate::ssh::detect_target(self.shell_pid) {
+                        self.ssh_hinted = true;
+                        self.transcript.push(Entry::Info(format!(
+                            "🔌 ssh session to {t} detected — /ssh attach makes that machine your workspace"
+                        )));
+                    }
                 }
             }
-            self.env.lock().unwrap().workspace = self.workspace.clone();
-            self.transcript.push(Entry::Info(format!("agent mode · workspace: {}", self.workspace.display())));
         }
     }
 
@@ -830,8 +1189,8 @@ fn short_output(o: &str) -> String {
 pub fn run(opts: Options) -> Result<()> {
     let mut cfg = Config::load().unwrap_or_default();
     cfg.normalize();
-    if opts.yolo {
-        cfg.agent.yolo = true;
+    if opts.ultra {
+        cfg.agent.ultra = true;
     }
 
     let pty_system = native_pty_system();
@@ -841,6 +1200,7 @@ pub fn run(opts: Options) -> Result<()> {
 
     let cmd = crate::integration::build_shell_command(opts.shell.as_deref())?;
     let mut child = pair.slave.spawn_command(cmd)?;
+    let shell_pid = child.process_id().unwrap_or(0);
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader()?;
     let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(pair.master.take_writer()?));
@@ -878,6 +1238,10 @@ pub fn run(opts: Options) -> Result<()> {
     let workspace = opts.workspace.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let provider = cfg.active().cloned();
     let model = provider.as_ref().and_then(|p| p.default_model.clone()).unwrap_or_default();
+    // Bundled how-to skills land in the skill library on first run.
+    crate::skills::ensure_bundled();
+    let mcp = Arc::new(Mutex::new(crate::mcp::Registry::new()));
+    mcp.lock().unwrap().sync_config(&cfg.mcp.servers);
     let env = Arc::new(Mutex::new(AgentEnv {
         provider,
         model,
@@ -885,8 +1249,10 @@ pub fn run(opts: Options) -> Result<()> {
         shell_cwd: std::env::current_dir().ok(),
         session_id: session::new_id(),
         reasoning_effort: cfg.agent.reasoning_effort(),
-        yolo: cfg.agent.yolo,
+        ultra: cfg.agent.ultra,
         unlimited_run: cfg.agent.unlimited_run,
+        mcp: mcp.clone(),
+        remote: None,
     }));
     let queue: crate::agent::InstructionQueue = Arc::new(Mutex::new(Vec::new()));
     let (handle, agent_ev) = crate::agent::spawn_agent(env.clone(), cfg.clone(), queue.clone());
@@ -915,6 +1281,7 @@ pub fn run(opts: Options) -> Result<()> {
         permission: None,
         secret: None,
         question: None,
+        sessions: None,
         scroll: 0,
         agent_scroll: 0,
         tick: 0,
@@ -926,7 +1293,16 @@ pub fn run(opts: Options) -> Result<()> {
         ctx_used: 0,
         ctx_window: provider_window(&cfg),
         screensaving: false,
-        saver_scene: crate::penguin::pick_scene(std::process::id() as u64),
+        saver_scene: 0,
+        saver_start: 0,
+        mcp,
+        mcp_import_cache: Vec::new(),
+        active_skills: Vec::new(),
+        ssh_hinted: false,
+        shell_pid,
+        saver_picker: crate::penguin::EffectPicker::new(
+            std::process::id() as u64 ^ (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x5EED)),
+        ),
         last_input: std::time::Instant::now(),
         busy_since: std::time::Instant::now(),
         first_token_at: None,
@@ -980,6 +1356,8 @@ pub fn run(opts: Options) -> Result<()> {
     if let Some(tx) = &app.agent_tx {
         let _ = tx.send(AgentCommand::Quit);
     }
+    // MCP child processes must not outlive the terminal.
+    app.mcp.lock().unwrap().shutdown();
     result
 }
 
@@ -997,7 +1375,9 @@ fn main_loop(
         app.maybe_screensave();
         terminal.draw(|f| render::render(app, f))?;
 
-        let timeout = std::time::Duration::from_millis(if app.busy { 30 } else { 60 });
+        // ~30fps while screensaving so the effects animate smoothly; the
+        // normal UI is fine at ~16fps and saves power.
+        let timeout = std::time::Duration::from_millis(if app.screensaving || app.busy { 30 } else { 60 });
         if !event::poll(timeout)? {
             continue;
         }
@@ -1056,7 +1436,7 @@ fn handle_event(
                 return Ok(false);
             }
             app.wake();
-            if app.secret.is_some() || app.permission.is_some() || app.question.is_some() {
+            if app.secret.is_some() || app.permission.is_some() || app.question.is_some() || app.sessions.is_some() {
                 // A modal owns the keyboard: never smuggle pasted text into
                 // the shell (or composer) behind a pending dialog.
                 return Ok(false);
@@ -1109,6 +1489,10 @@ fn handle_event(
             }
             if app.permission.is_some() {
                 handle_permission_key(app, &k);
+                return Ok(false);
+            }
+            if app.sessions.is_some() {
+                handle_picker_key(app, &k);
                 return Ok(false);
             }
             if k.code == app.toggle.0 && k.modifiers == app.toggle.1 {
@@ -1266,6 +1650,60 @@ fn handle_question_key(app: &mut App, k: &event::KeyEvent) {
             }
         }
         KeyCode::Esc => app.answer_question(None),
+        _ => {}
+    }
+}
+
+/// The `/sessions` menu: ↑↓ (or j/k) move, PgUp/PgDn jump a page, Enter
+/// resumes the highlighted session, Esc closes the menu and goes back.
+fn handle_picker_key(app: &mut App, k: &event::KeyEvent) {
+    let len = app.sessions.as_ref().map(|p| p.sessions.len()).unwrap_or(0);
+    if len == 0 {
+        app.sessions = None;
+        return;
+    }
+    match k.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(p) = app.sessions.as_mut() {
+                p.sel = p.sel.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(p) = app.sessions.as_mut() {
+                p.sel = (p.sel + 1).min(len - 1);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(p) = app.sessions.as_mut() {
+                p.sel = p.sel.saturating_sub(PICKER_PAGE);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(p) = app.sessions.as_mut() {
+                p.sel = (p.sel + PICKER_PAGE).min(len - 1);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(p) = app.sessions.as_mut() {
+                p.sel = 0;
+            }
+        }
+        KeyCode::End => {
+            if let Some(p) = app.sessions.as_mut() {
+                p.sel = len - 1;
+            }
+        }
+        KeyCode::Enter => {
+            let pick = app.sessions.as_ref().and_then(|p| p.sessions.get(p.sel).cloned());
+            app.sessions = None;
+            if let Some(s) = pick {
+                app.resume_session(s);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.sessions = None;
+            app.transcript.push(Entry::Info("session picker closed".into()));
+        }
         _ => {}
     }
 }

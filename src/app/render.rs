@@ -1,4 +1,4 @@
-use super::{App, Entry, Mode, QuestionModal};
+use super::{App, Entry, Mode, QuestionModal, SessionPicker, PICKER_PAGE};
 use crate::theme::*;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -216,7 +216,10 @@ pub fn render(app: &mut App, f: &mut Frame) {
     f.buffer_mut().set_style(area, Style::default().bg(OMARCHY.bg));
 
     if app.screensaving {
-        crate::penguin::render_screensaver(app.saver_scene, app.tick, f, area);
+        // entry-local time so reveals/glitches animate from their start on
+        // every rotation, not mid-stream
+        let local = app.tick.wrapping_sub(app.saver_start);
+        crate::penguin::render_screensaver(app.saver_scene, local, f, area);
         return;
     }
 
@@ -225,13 +228,27 @@ pub fn render(app: &mut App, f: &mut Frame) {
     if app.mode == Mode::Agent {
         // unified window: the agent owns the whole viewport below the status bar
         let sidebar_w: u16 = if area.width >= 108 { 32 } else { 0 };
-        let body = if sidebar_w > 0 {
-            let cols = Layout::horizontal([Constraint::Min(40), Constraint::Length(sidebar_w)]).split(top[1]);
-            render_sidebar(app, f, cols[1]);
-            cols[0]
-        } else {
-            top[1]
-        };
+        let mcp_rows = app.mcp.lock().map(|r| r.panel_rows()).unwrap_or_default();
+        let left_has_content = !mcp_rows.is_empty() || !app.active_skills.is_empty();
+        let left_w: u16 = if area.width >= 150 && left_has_content { 26 } else { 0 };
+        let mut cons = Vec::new();
+        if left_w > 0 {
+            cons.push(Constraint::Length(left_w));
+        }
+        cons.push(Constraint::Min(40));
+        if sidebar_w > 0 {
+            cons.push(Constraint::Length(sidebar_w));
+        }
+        let cols = Layout::horizontal(cons).split(top[1]);
+        let mut ci = 0usize;
+        if left_w > 0 {
+            render_left_panel(app, f, cols[ci], &mcp_rows);
+            ci += 1;
+        }
+        let body = cols[ci];
+        if sidebar_w > 0 {
+            render_sidebar(app, f, cols[cols.len() - 1]);
+        }
         // drawn before the status bar so the transcript can clamp agent_scroll
         render_agent_view(app, f, body, sidebar_w == 0);
     } else {
@@ -252,6 +269,10 @@ pub fn render(app: &mut App, f: &mut Frame) {
         let (prompt, typed) = (m.prompt.clone(), m.buf.chars().count());
         render_secret(f, area, &prompt, typed);
     }
+
+    if let Some(m) = &app.sessions {
+        render_sessions(f, area, m);
+    }
 }
 
 fn toggle_hint(agent: bool) -> String {
@@ -264,11 +285,15 @@ fn toggle_hint(agent: bool) -> String {
 
 fn render_status(app: &App, f: &mut Frame, area: Rect) {
     let agent = app.mode == Mode::Agent;
-    let (yolo, unlimited) = app
+    let (ultra, unlimited, remote_label) = app
         .env
         .lock()
-        .map(|e| (e.yolo, e.unlimited_run))
-        .unwrap_or((false, false));
+        .map(|e| (
+            e.ultra,
+            e.unlimited_run,
+            e.remote.as_ref().map(|r| r.label()),
+        ))
+        .unwrap_or((false, false, None));
     let mut spans = vec![
         Span::styled(" 🐧 PC ", Style::default().fg(OMARCHY.bg).bg(shimmer(app.tick)).add_modifier(Modifier::BOLD)),
         Span::styled("  ", Style::default()),
@@ -279,15 +304,19 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
         },
         Span::styled("  ", Style::default()),
     ];
-    if yolo {
-        spans.push(Span::styled(" ⚠ YOLO ", Style::default().fg(Color::White).bg(OMARCHY.danger).add_modifier(Modifier::BOLD)));
+    if ultra {
+        spans.push(Span::styled(" ⚠ ULTRA ", Style::default().fg(Color::White).bg(OMARCHY.danger).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled("  ", Style::default()));
     }
     if unlimited {
         spans.push(Span::styled(" ∞ UNLIMITED ", Style::default().fg(Color::Black).bg(OMARCHY.warn).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled("  ", Style::default()));
     }
-    spans.push(Span::styled(short_path(&workspace_of(app)), Style::default().fg(if agent { OMARCHY.accent } else { OMARCHY.muted })));
+    let ws_label = match &remote_label {
+        Some(l) => format!("🔌 {l}"),
+        None => short_path(&workspace_of(app)),
+    };
+    spans.push(Span::styled(ws_label, Style::default().fg(if agent { OMARCHY.accent } else { OMARCHY.muted })));
     if app.scroll > 0 {
         spans.push(Span::styled(format!(" ↑{} ", app.scroll), Style::default().fg(OMARCHY.warn)));
     }
@@ -475,7 +504,20 @@ fn render_agent_view(app: &mut App, f: &mut Frame, area: Rect, inline_plan: bool
     }
     render_composer(app, f, chunks[idx]);
     let completing = typing_slash && complete_slash(&app.composer).is_some();
-    render_keylegend(f, chunks[idx + 1], app.busy, app.queued.lock().unwrap().len(), completing);
+    // live "still working" readout right under the input box so the screen
+    // never looks frozen while the agent thinks or writes
+    let live = if app.busy {
+        let secs = app.busy_since.elapsed().as_secs();
+        let what = match &app.activity {
+            Some(t) => format!("⚙ {t}"),
+            None if !app.streaming.is_empty() => "✎ writing".into(),
+            None => "✻ thinking".into(),
+        };
+        Some(format!("{} {what} · ⏱{secs}s", spinner(app.tick)))
+    } else {
+        None
+    };
+    render_keylegend(f, chunks[idx + 1], app.queued.lock().unwrap().len(), completing, live);
 
     if let Some(pa) = plan_area {
         render_plan(app, f, pa);
@@ -499,6 +541,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/providers", "provider setup wizard"),
     ("/model", "[name] show or switch model"),
     ("/workspace", "<dir> set agent workspace"),
+    ("/mcp", "MCP servers: status · add/remove/trust/import"),
     ("/screensaver", "wake the penguins (idle screen)"),
     ("/clear", "clear transcript"),
     ("/help", "all commands"),
@@ -571,25 +614,92 @@ fn render_suggestions(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(0x16, 0x16, 0x1d))), area);
 }
 
-fn render_keylegend(f: &mut Frame, area: Rect, busy: bool, queued: usize, completing: bool) {
-    let owned;
-    let text: &str = if busy {
-        owned = if queued > 0 {
-            format!("enter queue · ⏳ {queued} waiting · esc stop agent · wheel scrolls · ctrl-space → shell")
+fn render_keylegend(f: &mut Frame, area: Rect, queued: usize, completing: bool, live: Option<String>) {
+    let line: Vec<Span> = if let Some(live) = live {
+        let mut v = vec![Span::styled(format!("{live}  "), Style::default().fg(OMARCHY.warn).add_modifier(Modifier::BOLD))];
+        let rest = if queued > 0 {
+            format!("⏳ {queued} waiting · enter queue · esc stop agent · wheel scrolls")
         } else {
-            "enter queue · esc stop agent · wheel scrolls · ctrl-space → shell".to_string()
+            "enter queue · esc stop agent · wheel scrolls".to_string()
         };
-        &owned
+        v.push(Span::styled(rest, Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC)));
+        v
     } else if completing {
-        owned = "enter completes & sends · keep typing to disambiguate · ctrl-space → shell".to_string();
-        &owned
+        vec![Span::styled("enter completes & sends · keep typing to disambiguate · ctrl-space → shell", Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC))]
     } else {
-        "enter send · shift/alt+enter newline · ↑↓ history · pgup/wheel scroll · tab expands output & diffs · /help · ctrl-space → shell"
+        let text = "enter send · shift/alt+enter newline · ↑↓ history · pgup/wheel scroll · tab expands output & diffs · /help · ctrl-space → shell";
+        vec![Span::styled(text, Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC))]
     };
-    f.render_widget(
-        Paragraph::new(Span::styled(text, Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC))),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(line)), area);
+}
+
+/// Left rail: MCP servers with live status lights + skills loaded this
+/// session. Only shown in agent mode on wide terminals with something to say.
+fn render_left_panel(app: &App, f: &mut Frame, area: Rect, mcp_rows: &[(String, &'static str, usize, bool)]) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(OMARCHY.panel_line))
+        .title(Line::from(Span::styled(
+            " live ",
+            Style::default().fg(OMARCHY.accent).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 10 || inner.height < 4 {
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " 🔌 mcp",
+        Style::default().fg(OMARCHY.accent2).add_modifier(Modifier::BOLD),
+    )));
+    if mcp_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  none configured",
+            Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        for (name, glyph, tools, disabled) in mcp_rows {
+            let col = match *glyph {
+                "●" => OMARCHY.success,
+                "✗" => OMARCHY.danger,
+                _ => OMARCHY.muted,
+            };
+            let label = if *disabled {
+                format!("{name} (off)")
+            } else if *tools > 0 {
+                format!("{name} · {tools}t")
+            } else {
+                name.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{glyph} "), Style::default().fg(col).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    crate::providers::truncate(&label, (inner.width as usize).saturating_sub(2)).to_string(),
+                    Style::default().fg(if *disabled { OMARCHY.muted } else { OMARCHY.text }),
+                ),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " ✦ skills",
+        Style::default().fg(OMARCHY.accent2).add_modifier(Modifier::BOLD),
+    )));
+    if app.active_skills.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  none loaded yet",
+            Style::default().fg(OMARCHY.muted).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        for s in &app.active_skills {
+            lines.push(Line::from(Span::styled(
+                format!(" · {}", crate::providers::truncate(s, (inner.width as usize).saturating_sub(3))),
+                Style::default().fg(OMARCHY.accent),
+            )));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_sidebar(app: &App, f: &mut Frame, area: Rect) {
@@ -929,10 +1039,19 @@ fn render_composer(app: &mut App, f: &mut Frame, area: Rect) {
     let width = (area.width as usize).saturating_sub(4).max(1);
     let mut out: Vec<Line> = Vec::new();
     for (i, l) in composer_wrap(&app.composer, width).into_iter().enumerate() {
-        let mut spans = vec![Span::styled(
-            if i == 0 { "✻ ❯ ".to_string() } else { "    ".to_string() },
-            Style::default().fg(shimmer(app.tick)).add_modifier(Modifier::BOLD),
-        )];
+        let glyph = if i != 0 {
+            "    ".to_string()
+        } else if app.busy {
+            format!("{} ❯ ", spinner(app.tick))
+        } else {
+            "✻ ❯ ".to_string()
+        };
+        let gstyle = if app.busy {
+            Style::default().fg(OMARCHY.warn).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(shimmer(app.tick)).add_modifier(Modifier::BOLD)
+        };
+        let mut spans = vec![Span::styled(glyph, gstyle)];
         spans.push(Span::styled(l, Style::default().fg(OMARCHY.text)));
         out.push(Line::from(spans));
     }
@@ -1173,6 +1292,70 @@ fn render_question(f: &mut Frame, area: Rect, m: &QuestionModal) {
         "↑↓ select · enter confirm · 1-9 quick pick · c custom answer · esc skip (agent decides alone)"
     };
     f.render_widget(Paragraph::new(Span::styled(hint, Style::default().fg(OMARCHY.muted))), chunks[2]);
+}
+
+/// The `/sessions` menu: a paginated, keyboard-selectable list of saved
+/// sessions. ↑↓ move (the page follows the selection), Enter resumes, Esc backs out.
+fn render_sessions(f: &mut Frame, area: Rect, m: &SessionPicker) {
+    let width = 92.min(area.width.saturating_sub(4));
+    if width < 40 || area.height < 8 {
+        return;
+    }
+    let total = m.sessions.len();
+    let pages = total.div_ceil(PICKER_PAGE).max(1);
+    let page = (m.sel / PICKER_PAGE).min(pages - 1);
+    let start = page * PICKER_PAGE;
+    let rows = PICKER_PAGE.min(total - start).min((area.height as usize).saturating_sub(6));
+
+    let height = (rows as u16 + 5).min(area.height.saturating_sub(2));
+    let box_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, box_area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(OMARCHY.agent_line))
+        .title(Span::styled(
+            format!(" 🗂 sessions · {} saved · page {}/{} ", total, page + 1, pages),
+            Style::default().fg(OMARCHY.accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Rgb(0x18, 0x14, 0x1c)));
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+
+    let sel_style = Style::default().fg(Color::Rgb(0x14, 0x10, 0x20)).bg(shimmer(0)).add_modifier(Modifier::BOLD);
+    let row_w = inner.width.saturating_sub(6) as usize;
+    for (i, s) in m.sessions.iter().enumerate().take(start + rows).skip(start) {
+        let selected = i == m.sel;
+        let goal_mark = match &s.goal {
+            Some(g) if g.verified => "★",
+            Some(_) => "◐",
+            None => " ",
+        };
+        let model = if s.model.is_empty() { "—" } else { s.model.as_str() };
+        let line = Line::from(Span::styled(
+            format!(
+                "{} {} · {} msgs · {} · {}",
+                goal_mark,
+                crate::session::fmt_ts(s.updated_ms),
+                s.messages.len(),
+                crate::providers::truncate(model, 22),
+                crate::providers::truncate(&s.title, row_w.saturating_sub(56)),
+            ),
+            if selected { sel_style } else { Style::default().fg(OMARCHY.text) },
+        ));
+        let r = Rect { x: inner.x, y: inner.y + (i - start) as u16, width: inner.width, height: 1 };
+        f.render_widget(Paragraph::new(line), r);
+    }
+
+    let hint = "↑↓ move · enter resume · esc back · ★ verified goal · ◐ unfinished";
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(OMARCHY.muted))),
+        Rect { x: inner.x, y: (inner.y + rows as u16).min(inner.y + inner.height.saturating_sub(1)), width: inner.width, height: 1 },
+    );
 }
 
 /// Modal for entering a password a child command (sudo) is waiting on.

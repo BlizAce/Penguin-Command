@@ -106,6 +106,7 @@ pub fn run_setup(cfg: &Config) -> Result<Config> {
                             models: vec![],
                             default_model: None,
                             context_window: None,
+                            vision: false,
                         });
                         app.sel = app.cfg.providers.len() - 1;
                         app.open_editor(app.sel);
@@ -119,6 +120,12 @@ pub fn run_setup(cfg: &Config) -> Result<Config> {
                                 app.cfg.active_provider = Some(p.name.clone());
                                 app.status = format!("active → {}", p.name);
                             }
+                        }
+                    }
+                    KeyCode::Char('v') => {
+                        if let Some(p) = app.cfg.providers.get_mut(app.sel) {
+                            p.vision = !p.vision;
+                            app.status = format!("vision input → {} for {}", if p.vision { "ON" } else { "off" }, p.name);
                         }
                     }
                     KeyCode::Char('d') => {
@@ -222,6 +229,19 @@ pub fn run_setup(cfg: &Config) -> Result<Config> {
                                 }
                             }
                         }
+                    }
+                    KeyCode::Char('v') if !matches!(app.field, 0 | 2 | 3) => {
+                        let idx = match app.screen {
+                            Screen::Editor(i) => i,
+                            _ => 0,
+                        };
+                        let p = &mut app.cfg.providers[idx];
+                        p.vision = !p.vision;
+                        app.status = format!(
+                            "vision input → {} — view_screenshot tool {}",
+                            if p.vision { "ON" } else { "off" },
+                            if p.vision { "exposed to the agent" } else { "hidden" }
+                        );
                     }
                     KeyCode::Char('m') if !matches!(app.field, 0 | 2 | 3) => {
                         let idx = match app.screen {
@@ -372,6 +392,7 @@ fn draw_list(app: &SetupApp, f: &mut Frame, area: Rect) {
                 ),
                 Span::styled(format!("{:<20}", p.name), Style::default().fg(OMARCHY.text).add_modifier(if i == app.sel { Modifier::BOLD } else { Modifier::empty() })),
                 Span::styled(format!("{:<18}", p.kind.label()), Style::default().fg(OMARCHY.accent2)),
+                Span::styled(if p.vision { "👁 " } else { "  " }, Style::default().fg(OMARCHY.accent)),
                 Span::styled(&p.base_url, Style::default().fg(OMARCHY.muted)),
             ]))
         })
@@ -384,7 +405,7 @@ fn draw_list(app: &SetupApp, f: &mut Frame, area: Rect) {
     keybar(
         f,
         block[2],
-        &[("↑↓","move"),("enter","edit"),("a","add"),("s","set active"),("d","delete"),("q","quit & save")],
+        &[("↑↓","move"),("enter","edit"),("a","add"),("s","set active"),("v","vision"),("d","delete"),("q","quit & save")],
     );
     if !app.status.is_empty() {
         let p = Paragraph::new(Span::styled(app.status.clone(), Style::default().fg(OMARCHY.success)));
@@ -401,7 +422,7 @@ fn draw_editor(app: &SetupApp, f: &mut Frame, area: Rect) {
     f.render_widget(Clear, box_area);
     let block = Block::bordered().border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(OMARCHY.agent_line))
-        .title(Span::styled(" provider ", Style::default().fg(OMARCHY.accent)));
+        .title(Span::styled(format!(" provider · vision {} (v) ", if p.vision { "ON 👁" } else { "off" }), Style::default().fg(OMARCHY.accent)));
     let inner_area = block.inner(box_area);
     f.render_widget(block, box_area);
     let inner = Layout::vertical([

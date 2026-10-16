@@ -501,38 +501,38 @@ pub enum ReaderOutcome {
 pub fn sandbox_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
-            name: "run_command",
-            description: "Run a shell command in the sandbox workspace. Returns stdout+stderr.",
+            name: "run_command".to_string(),
+            description: "Run a shell command in the sandbox workspace. Returns stdout+stderr.".to_string(),
             schema: json!({"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_secs":{"type":"integer"}},"required":["command"]}),
         },
         ToolSpec {
-            name: "read_file",
-            description: "Read a text file from the sandbox workspace. Returns numbered lines.",
+            name: "read_file".to_string(),
+            description: "Read a text file from the sandbox workspace. Returns numbered lines.".to_string(),
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}),
         },
         ToolSpec {
-            name: "write_file",
-            description: "Create or overwrite a file in the sandbox workspace.",
+            name: "write_file".to_string(),
+            description: "Create or overwrite a file in the sandbox workspace.".to_string(),
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
         },
         ToolSpec {
-            name: "edit_file",
-            description: "Replace an exact string occurrence in a sandbox workspace file.",
+            name: "edit_file".to_string(),
+            description: "Replace an exact string occurrence in a sandbox workspace file.".to_string(),
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}),
         },
         ToolSpec {
-            name: "list_dir",
-            description: "List a directory in the sandbox workspace.",
+            name: "list_dir".to_string(),
+            description: "List a directory in the sandbox workspace.".to_string(),
             schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         },
         ToolSpec {
-            name: "set_permissions",
-            description: "Change file permissions or ownership in the sandbox workspace.",
+            name: "set_permissions".to_string(),
+            description: "Change file permissions or ownership in the sandbox workspace.".to_string(),
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"mode":{"type":"string"},"owner":{"type":"string"}},"required":["path"]}),
         },
         ToolSpec {
-            name: "http_post",
-            description: "Send data to a URL (HTTP POST). Returns the response status.",
+            name: "http_post".to_string(),
+            description: "Send data to a URL (HTTP POST). Returns the response status.".to_string(),
             schema: json!({"type":"object","properties":{"url":{"type":"string"},"body":{"type":"string"}},"required":["url","body"]}),
         },
     ]
@@ -605,7 +605,7 @@ pub fn read_in_sandbox(
             abort,
         };
         let resp = providers::chat(provider, model, &messages, &specs, rcfg, &mut ctx)?;
-        messages.push(ChatMsg { role: Role::Assistant, text: resp.text.clone(), tool_calls: resp.tool_calls.clone(), tool_call_id: None });
+        messages.push(ChatMsg { role: Role::Assistant, text: resp.text.clone(), tool_calls: resp.tool_calls.clone(), tool_call_id: None, images: vec![] });
         if !resp.text.trim().is_empty() {
             last_text = resp.text.trim().to_string();
         }

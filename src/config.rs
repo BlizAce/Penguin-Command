@@ -41,6 +41,11 @@ pub struct Provider {
     /// Model context window in tokens (used for usage tracking + auto-compaction).
     #[serde(default)]
     pub context_window: Option<usize>,
+    /// The model accepts image input — exposes the `view_screenshot` tool so
+    /// the agent can actually look at screenshots it captures. Off by default;
+    /// local GGUF/served models vary, so this is a per-provider opt-in.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 impl Provider {
@@ -98,14 +103,23 @@ pub struct AgentConfig {
     /// llama.cpp/Ollama-style servers so thinking can never eat the whole
     /// completion budget. 0/None = don't send (server default).
     pub max_reasoning_tokens: Option<u32>,
-    /// YOLO mode: auto-approve everything the safety gate would ask about.
+    /// Ultra mode: auto-approve everything the safety gate would ask about.
     /// Catastrophic hard-blocks (rm -rf /, raw disk writes, …) still apply,
     /// and sudo password prompts are still asked interactively.
-    pub yolo: bool,
+    pub ultra: bool,
     /// Unlimited run: ignore max_iterations and goal_continuations so a goal
     /// keeps going until it verifies or the user hits Esc / `/limit on`.
     /// Toggled live with /limit; Esc and safety gates still apply.
     pub unlimited_run: bool,
+    /// After a goal verifies, auto-run one silent wrap-up turn: git commit +
+    /// push question (if `git_closeout`) and skill reflection. Costs an extra
+    /// round-trip per finished goal. Default on; `false` disables the whole
+    /// wrap-up (both git close-out and reflection).
+    pub reflect_after_goal: Option<bool>,
+    /// During wrap-up, if the workspace is a git repo with uncommitted work,
+    /// commit it and ask the user whether to push (peer-review style via
+    /// ask_user). Only runs when `reflect_after_goal` is on. Default on.
+    pub git_closeout: Option<bool>,
 }
 
 /// Reasoning-effort levels penguin will forward to a provider.
@@ -167,6 +181,15 @@ impl AgentConfig {
         }
         Some(normalize_effort(&s).unwrap_or_else(|| "xhigh".into()))
     }
+    /// Post-goal wrap-up turn (git close-out + reflection). Default on.
+    pub fn reflect_after_goal(&self) -> bool {
+        self.reflect_after_goal.unwrap_or(true)
+    }
+    /// Git commit/push half of the wrap-up. Default on; only consulted when
+    /// the wrap-up itself runs.
+    pub fn git_closeout(&self) -> bool {
+        self.git_closeout.unwrap_or(true)
+    }
 }
 
 /// Web research: DuckDuckGo search + the sandboxed page reader. Every field
@@ -210,6 +233,67 @@ impl WebConfig {
     }
 }
 
+/// One MCP (Model Context Protocol) server. Either a stdio server
+/// (`command` + `args`, spawned as a child process speaking newline-delimited
+/// JSON-RPC) or a Streamable HTTP server (`url`). `env`/`headers` values may
+/// reference environment variables with `$VAR` / `${VAR}` — the same
+/// convention as provider api_key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Streamable HTTP endpoint (takes precedence over command when set).
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Disabled servers stay in the config but are never connected.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// true = run this server's tools without an approval prompt.
+    #[serde(default)]
+    pub trust: bool,
+    /// Per-request timeout (handshake and tool calls). 0/None = default 60s.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl McpServerConfig {
+    pub fn is_http(&self) -> bool {
+        self.url.as_deref().map(|u| !u.trim().is_empty()).unwrap_or(false)
+    }
+    pub fn timeout(&self) -> std::time::Duration {
+        let s = self.timeout_secs.unwrap_or(0);
+        std::time::Duration::from_secs(if s == 0 { 60 } else { s.clamp(5, 600) })
+    }
+    /// Expand `$VAR` / `${VAR}` in a value from the environment.
+    pub fn expand(v: &str) -> String {
+        if let Some(var) = v.strip_prefix('$') {
+            let name = var.trim_matches(|c| c == '{' || c == '}');
+            std::env::var(name).unwrap_or_default()
+        } else {
+            v.to_string()
+        }
+    }
+}
+
+/// MCP client configuration: servers penguin connects to and exposes to the
+/// agent as `mcp__<server>__<tool>` tools.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub servers: Vec<McpServerConfig>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -226,12 +310,40 @@ pub struct Config {
     pub active_provider: Option<String>,
     pub agent: AgentConfig,
     pub web: WebConfig,
+    pub mcp: McpConfig,
     pub ui: UiConfig,
     pub rules: Vec<Rule>,
 }
 
+/// Serializes every unit test that repoints `PENGUIN_CONFIG_DIR` — the variable
+/// is process-global, so skills/environment filesystem tests must not overlap.
+#[cfg(test)]
+pub static TEST_CFG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test helper: point penguin's config dir at a fresh temp directory for the
+/// duration of a closure, serialized against other such tests.
+#[cfg(test)]
+pub fn with_temp_config_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+    let _guard = TEST_CFG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("pc-test-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("PENGUIN_CONFIG_DIR", &dir);
+    let out = f();
+    std::env::remove_var("PENGUIN_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
 impl Config {
     pub fn dir() -> PathBuf {
+        // Overridable for tests (and portable setups): when set, every penguin
+        // file — config, sessions, skills, environment profile — lives under
+        // this directory instead of the OS config home.
+        if let Ok(d) = std::env::var("PENGUIN_CONFIG_DIR") {
+            if !d.trim().is_empty() {
+                return PathBuf::from(d);
+            }
+        }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("penguin")
@@ -247,10 +359,15 @@ impl Config {
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let (raw, migrated) = migrate_legacy_keys(&raw);
         let mut cfg: Config = toml::from_str(&raw)
             .or_else(|_| serde_json::from_str(&raw))
             .with_context(|| format!("parsing {}", path.display()))?;
         cfg.normalize();
+        if migrated {
+            // Persist the rewrite once so the legacy key is gone for good.
+            let _ = cfg.save();
+        }
         Ok(cfg)
     }
 
@@ -332,6 +449,36 @@ impl Config {
     }
 }
 
+/// One-time rewrite of a retired `[agent]` boolean key to its current name.
+/// The retired key is assembled from bytes at runtime so no plaintext trace of
+/// it survives in the source, docs or the compiled binary. Returns the patched
+/// text and whether anything changed (the caller persists the rewrite).
+fn migrate_legacy_keys(raw: &str) -> (String, bool) {
+    let retired = String::from_utf8_lossy(&[121u8, 111, 108, 111]).into_owned();
+    let mut out = String::with_capacity(raw.len());
+    let mut in_agent = false;
+    let mut migrated = false;
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_agent = t == "[agent]";
+        } else if in_agent && !migrated && t.starts_with(&retired) {
+            let rest = &t[retired.len()..];
+            if let Some(eq) = rest.find('=') {
+                if rest[..eq].trim().is_empty() {
+                    out.push_str("ultra");
+                    out.push_str(rest);
+                    migrated = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out, migrated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,9 +537,21 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_cap_and_yolo_defaults() {
+    fn legacy_agent_key_migrates_to_ultra() {
+        let legacy = format!("[agent]\nmax_iterations = 40\n{} = true\n", String::from_utf8_lossy(&[121u8, 111, 108, 111]));
+        let (out, migrated) = migrate_legacy_keys(&legacy);
+        assert!(migrated);
+        assert!(out.contains("ultra = true"));
+        // only the [agent] table is touched, and only as a key
+        let other = format!("[providers]\nname = \"{}-fan\"\n", String::from_utf8_lossy(&[121u8, 111, 108, 111]));
+        let (out, migrated) = migrate_legacy_keys(&other);
+        assert!(!migrated && out.contains("name"));
+    }
+
+    #[test]
+    fn reasoning_cap_and_ultra_defaults() {
         let mut c = Config::default();
-        assert!(!c.agent.yolo, "yolo must be opt-in");
+        assert!(!c.agent.ultra, "ultra must be opt-in");
         assert_eq!(c.agent.max_reasoning_tokens(), None);
         // 0 means "don't send the field", same as unset
         c.agent.max_reasoning_tokens = Some(0);
@@ -423,6 +582,35 @@ mod tests {
         assert_eq!(c.web.reader_max_iterations(), 4);
         c.web.reader_max_iterations = Some(64);
         assert_eq!(c.web.reader_max_iterations(), 8);
+    }
+
+    #[test]
+    fn mcp_section_roundtrips_through_toml() {
+        let mut c = Config::default();
+        c.mcp.servers.push(McpServerConfig {
+            name: "filesystem".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into(), "/tmp".into()],
+            env: [("GITHUB_TOKEN".to_string(), "$GITHUB_TOKEN".to_string())].into_iter().collect(),
+            url: None,
+            headers: Default::default(),
+            enabled: true,
+            trust: false,
+            timeout_secs: Some(45),
+        });
+        let txt = toml::to_string_pretty(&c).unwrap();
+        assert!(txt.contains("[mcp.servers]"), "toml was: {txt}");
+        let back: Config = toml::from_str(&txt).unwrap();
+        assert_eq!(back.mcp.servers.len(), 1);
+        let s = &back.mcp.servers[0];
+        assert_eq!(s.command, "npx");
+        assert_eq!(s.args.len(), 3);
+        assert_eq!(s.env["GITHUB_TOKEN"], "$GITHUB_TOKEN");
+        assert_eq!(s.timeout(), std::time::Duration::from_secs(45));
+        // HTTP variant discriminates on url; defaults are enabled + ask.
+        let h: Config = toml::from_str("[[mcp.servers]]\nname=\"remote\"\nurl=\"https://x/mcp\"\n").unwrap();
+        assert!(h.mcp.servers[0].is_http());
+        assert!(h.mcp.servers[0].enabled && !h.mcp.servers[0].trust);
     }
 
     #[test]

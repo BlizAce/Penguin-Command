@@ -23,6 +23,18 @@ pub struct ToolCall {
     pub args: Value,
 }
 
+/// A base64-encoded raster image attached to a message (vision input).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagePart {
+    /// e.g. "image/png"
+    pub mime: String,
+    /// Raw base64 (no data-URI prefix).
+    pub data_b64: String,
+}
+
+/// Rough token cost attributed to one attached image across providers.
+pub const IMAGE_TOKEN_ESTIMATE: usize = 1_500;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMsg {
     pub role: Role,
@@ -32,24 +44,34 @@ pub struct ChatMsg {
     /// For role==Tool: id of the tool call this answers.
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Vision input attached to this message (typically user turns). Kept out
+    /// of the JSON when empty so old transcripts and providers see plain text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImagePart>,
 }
 
 impl ChatMsg {
     pub fn user(text: impl Into<String>) -> Self {
-        ChatMsg { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None }
+        ChatMsg { role: Role::User, text: text.into(), tool_calls: vec![], tool_call_id: None, images: vec![] }
     }
     pub fn system(text: impl Into<String>) -> Self {
-        ChatMsg { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None }
+        ChatMsg { role: Role::System, text: text.into(), tool_calls: vec![], tool_call_id: None, images: vec![] }
     }
     pub fn tool_result(id: impl Into<String>, text: impl Into<String>) -> Self {
-        ChatMsg { role: Role::Tool, text: text.into(), tool_calls: vec![], tool_call_id: Some(id.into()) }
+        ChatMsg { role: Role::Tool, text: text.into(), tool_calls: vec![], tool_call_id: Some(id.into()), images: vec![] }
+    }
+    /// A tool result that also carries an image. Anthropic nests it inside
+    /// the tool_result block natively; the OpenAI path re-emits it as a
+    /// follow-up user turn (tool messages there are text-only).
+    pub fn tool_result_with_image(id: impl Into<String>, text: impl Into<String>, img: ImagePart) -> Self {
+        ChatMsg { role: Role::Tool, text: text.into(), tool_calls: vec![], tool_call_id: Some(id.into()), images: vec![img] }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub schema: Value,
 }
 
@@ -100,6 +122,11 @@ fn rough_prompt_tokens(msgs: &[ChatMsg], tools: &[ToolSpec]) -> usize {
         chars += m.text.chars().count();
         for tc in &m.tool_calls {
             chars += tc.name.len() + tc.args.to_string().len();
+        }
+        // Images cost far more than their base64 length suggests to a
+        // vision encoder; attribute a flat per-image budget.
+        if !m.images.is_empty() {
+            chars += m.images.len() * IMAGE_TOKEN_ESTIMATE * 4;
         }
     }
     for t in tools {
@@ -287,7 +314,19 @@ fn openai_messages(msgs: &[ChatMsg]) -> Value {
     for m in msgs {
         match m.role {
             Role::System => out.push(json!({"role": "system", "content": m.text})),
-            Role::User => out.push(json!({"role": "user", "content": m.text})),
+            Role::User => {
+                if m.images.is_empty() {
+                    out.push(json!({"role": "user", "content": m.text}));
+                } else {
+                    // Vision models accept a content-parts array; the text
+                    // leads so image-less backends still see something sane.
+                    let mut parts: Vec<Value> = vec![json!({"type": "text", "text": m.text})];
+                    for img in &m.images {
+                        parts.push(json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", img.mime, img.data_b64)}}));
+                    }
+                    out.push(json!({"role": "user", "content": parts}));
+                }
+            }
             Role::Assistant => {
                 if m.tool_calls.is_empty() {
                     out.push(json!({"role": "assistant", "content": m.text}));
@@ -300,7 +339,18 @@ fn openai_messages(msgs: &[ChatMsg]) -> Value {
                     out.push(json!({"role": "assistant", "content": if m.text.is_empty() { Value::Null } else { json!(m.text) }, "tool_calls": tcs}));
                 }
             }
-            Role::Tool => out.push(json!({"role": "tool", "tool_call_id": m.tool_call_id, "content": m.text})),
+            Role::Tool => {
+                out.push(json!({"role": "tool", "tool_call_id": m.tool_call_id, "content": m.text}));
+                // OpenAI tool messages are text-only; an image the tool wants
+                // shown rides in as a follow-up user turn right after it.
+                if !m.images.is_empty() {
+                    let mut parts: Vec<Value> = vec![json!({"type": "text", "text": &m.text})];
+                    for img in &m.images {
+                        parts.push(json!({"type": "image_url", "image_url": {"url": format!("data:{};base64,{}", img.mime, img.data_b64)}}));
+                    }
+                    out.push(json!({"role": "user", "content": parts}));
+                }
+            }
         }
     }
     json!(out)
@@ -317,10 +367,26 @@ fn anthropic_parts(msgs: &[ChatMsg]) -> (Value, Value) {
                 }
                 system.push_str(&m.text);
             }
-            Role::User => out.push(json!({"role": "user", "content": [{"type": "text", "text": m.text}]})),
+            Role::User => {
+                let mut blocks: Vec<Value> = Vec::new();
+                for img in &m.images {
+                    blocks.push(json!({"type": "image", "source": {"type": "base64", "media_type": img.mime, "data": img.data_b64}}));
+                }
+                blocks.push(json!({"type": "text", "text": m.text}));
+                out.push(json!({"role": "user", "content": blocks}));
+            }
             Role::Tool => {
                 // merge consecutive tool results into one user message
-                let block = json!({"type": "tool_result", "tool_use_id": m.tool_call_id, "content": m.text});
+                let block = if m.images.is_empty() {
+                    json!({"type": "tool_result", "tool_use_id": m.tool_call_id, "content": m.text})
+                } else {
+                    // Anthropic nests images natively inside a tool_result.
+                    let mut content: Vec<Value> = vec![json!({"type": "text", "text": m.text})];
+                    for img in &m.images {
+                        content.push(json!({"type": "image", "source": {"type": "base64", "media_type": img.mime, "data": img.data_b64}}));
+                    }
+                    json!({"type": "tool_result", "tool_use_id": m.tool_call_id, "content": content})
+                };
                 let merge = out.last_mut().and_then(|last| {
                     if last.get("role").and_then(|r| r.as_str()) == Some("user")
                         && last.get("content").map(|c| c.is_array()).unwrap_or(false)
@@ -798,7 +864,39 @@ mod tests {
             models: vec![],
             default_model: None,
             context_window: None,
+            vision: false,
         }
+    }
+
+    #[test]
+    fn images_serialize_for_both_provider_shapes() {
+        let img = ImagePart { mime: "image/png".into(), data_b64: "AAECAw==".into() };
+
+        // OpenAI: a user image becomes a content-parts array with an image_url.
+        let o = openai_messages(&[ChatMsg::tool_result_with_image("c1", "look", img.clone())]);
+        let s = o.to_string();
+        assert!(s.contains("\"role\":\"user\""), "{s}");
+        assert!(s.contains("data:image/png;base64,AAECAw=="), "{s}");
+        // The tool message itself is still emitted (text-only) before it.
+        assert!(s.contains("\"role\":\"tool\""), "{s}");
+
+        // Anthropic: the image nests inside the tool_result content array.
+        let (_sys, a) = anthropic_parts(&[ChatMsg::tool_result_with_image("c1", "look", img.clone())]);
+        let as_str = a.to_string();
+        assert!(as_str.contains("\"type\":\"image\""), "{as_str}");
+        assert!(as_str.contains("\"media_type\":\"image/png\""), "{as_str}");
+
+        // No images ⇒ plain string content (unchanged wire format for text).
+        let plain = openai_messages(&[ChatMsg::user("hi")]);
+        assert_eq!(plain[0]["content"].as_str(), Some("hi"));
+    }
+
+    #[test]
+    fn image_token_estimate_counts_toward_prompt() {
+        let img = ImagePart { mime: "image/png".into(), data_b64: "AAECAw==".into() };
+        let with = ChatMsg::tool_result_with_image("c", "x", img);
+        let without = ChatMsg::tool_result("c", "x");
+        assert!(rough_prompt_tokens(&[with], &[]) > rough_prompt_tokens(&[without], &[]));
     }
 
     fn fast_cfg(retries: usize) -> RequestCfg {
@@ -991,6 +1089,7 @@ mod tests {
             models: vec![],
             default_model: Some(model.clone()),
             context_window: std::env::var("PC_LIVE_CTX").ok().and_then(|v| v.parse().ok()),
+            vision: false,
         };
         let abort = AtomicBool::new(false);
         let mut reasoning = 0usize;

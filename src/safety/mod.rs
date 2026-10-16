@@ -161,7 +161,7 @@ impl Gate {
             (Regex::new(r"\b(chmod|chown)\b[^|;&]*\s-[a-zA-Z]*R[a-zA-Z]*\s+\S+\s+/(\s|$)").unwrap(), "recursive permission change on /"),
             (Regex::new(r"\b(pkill|killall|taskkill)\b.*(pc\b|penguin-command)").unwrap(), "terminating penguin command itself"),
             // Remote code execution: fetched content must never reach an
-            // interpreter. Hard-blocked — no approval, no YOLO override.
+            // interpreter. Hard-blocked — no approval, no ULTRA override.
             (Regex::new(r"(?i)(curl|wget|iwr|invoke-webrequest|invoke-restmethod)[^|]*\|\s*(sudo\s+)?(ba|z|k|da)?sh\b").unwrap(), "piping a remote script into a shell"),
             (Regex::new(r"(?i)(curl|wget|iwr|invoke-webrequest|invoke-restmethod)[^|]*\|\s*(sudo\s+)?(python\d*|perl|ruby|node|php|tclsh|lua)\b").unwrap(), "piping a remote script into an interpreter"),
             (Regex::new(r"(?i)\beval\b.*\$\(\s*(curl|wget|iwr|invoke-webrequest)").unwrap(), "evaluating a fetched remote script"),
@@ -237,7 +237,7 @@ impl Gate {
             }
         }
         // Blocklisted hosts are unreachable by any command (hard-deny beats
-        // rules and YOLO; remote-code pipe-to-shell patterns live in
+        // rules and ULTRA; remote-code pipe-to-shell patterns live in
         // hard_deny above).
         if let Some(host) = blocked_host_hit(&self.blocked_hosts, &cn) {
             return Verdict::HardDeny(format!("`{host}` is on your blocklist. Refused."));
@@ -314,6 +314,12 @@ impl Gate {
             detail: path.display().to_string(),
             rule_key: key,
         })
+    }
+
+    /// Recorded always/never decision for an exact rule key (used by tool
+    /// families outside the command/file checkers, e.g. MCP tools).
+    pub fn rule_decision(&self, key: &str) -> Option<Decision> {
+        self.rules.iter().find(|r| r.pattern == key).map(|r| r.decision)
     }
 
     pub fn record(&mut self, outcome: &Outcome, key: &str) {

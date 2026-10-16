@@ -2,13 +2,16 @@ mod agent;
 mod app;
 mod config;
 mod diff;
+mod environment;
 mod integration;
+mod mcp;
 mod penguin;
 mod providers;
 mod safety;
 mod session;
 mod setup_tui;
 mod skills;
+mod ssh;
 mod term;
 mod theme;
 mod web;
@@ -39,10 +42,10 @@ struct Cli {
     #[arg(short = 'c', long = "continue", global = true)]
     cont: bool,
 
-    /// YOLO mode: auto-approve every tool action (catastrophic hard-blocks
+    /// Ultra mode: auto-approve every tool action (catastrophic hard-blocks
     /// and sudo password prompts still apply)
     #[arg(long, global = true)]
-    yolo: bool,
+    ultra: bool,
 }
 
 #[derive(Subcommand)]
@@ -64,7 +67,7 @@ fn main() -> Result<()> {
             workspace: cli.workspace,
             prompt: cli.prompt,
             cont_last: cli.cont,
-            yolo: cli.yolo,
+            ultra: cli.ultra,
         })?,
     }
     Ok(())
