@@ -80,12 +80,144 @@ pub fn new_id() -> String {
     format!("{}", now_ms())
 }
 
-fn dir() -> PathBuf {
+pub fn dir() -> PathBuf {
     crate::config::Config::dir().join("sessions")
 }
 
 fn path_for(id: &str) -> PathBuf {
     dir().join(format!("{id}.json"))
+}
+
+/// Human-readable goal/plan tracker written alongside the session as
+/// `sessions/<id>.progress.md` — survives compaction, greppable, and shows
+/// exactly which steps were skipped rather than silently marked done.
+pub fn write_progress(id: &str, goal: &GoalState) {
+    let mut md = format!("# Goal\n\n{}\n\n## Plan\n\n", goal.text.trim());
+    if goal.plan.is_empty() {
+        md.push_str("_(no steps published yet)_\n");
+    }
+    for (label, status) in &goal.plan {
+        let mark = match status.as_str() {
+            "done" => "x",
+            "failed" => "!",
+            "skipped" => "-",
+            _ => " ",
+        };
+        md.push_str(&format!("- [{mark}] {label}  `({status})`\n"));
+    }
+    md.push_str(&format!(
+        "\n_verified: {} · updated: {}_\n",
+        goal.verified,
+        fmt_ts(now_ms())
+    ));
+    let _ = std::fs::create_dir_all(dir());
+    let _ = std::fs::write(dir().join(format!("{id}.progress.md")), md);
+}
+
+/// Suffixes that belong to a session group (shared stem = shared session id).
+const GROUP_SUFFIXES: [&str; 4] = [".log.jsonl", ".injection.log", ".progress.md", ".json"];
+
+fn group_stem(name: &str) -> Option<&str> {
+    GROUP_SUFFIXES.iter().find(|suf| name.ends_with(*suf)).map(|suf| &name[..name.len() - suf.len()])
+}
+
+/// Result of a [`prune`] pass.
+#[derive(Debug, Clone, Copy)]
+pub struct PruneReport {
+    pub removed_groups: usize,
+    pub freed_bytes: u64,
+}
+
+/// Enforce the disk budget over `sessions/`: when all session files (JSON +
+/// injection/activity/progress sidecars) exceed `max_bytes`, whole groups are
+/// deleted oldest-first (session id = creation ms) until it fits. The group
+/// named by `exclude_id` — the live session — is never touched. Returns
+/// `None` when nothing needed deleting.
+pub fn prune(exclude_id: &str, max_bytes: u64) -> Option<PruneReport> {
+    let d = dir();
+    let rd = std::fs::read_dir(&d).ok()?;
+    // (id, files, bytes) per group
+    let mut groups: std::collections::BTreeMap<u64, (Vec<PathBuf>, u64)> = Default::default();
+    let mut total = 0u64;
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = p.file_name().and_then(|n| n.to_str())?.to_string();
+        let stem = group_stem(&name)?;
+        let id: u64 = stem.parse().ok()?;
+        let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+        total += size;
+        let g = groups.entry(id).or_insert_with(|| (Vec::new(), 0));
+        g.0.push(p);
+        g.1 += size;
+    }
+    if total <= max_bytes || groups.is_empty() {
+        return None;
+    }
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for (id, (files, bytes)) in groups {
+        if total <= max_bytes {
+            break;
+        }
+        if id.to_string() == exclude_id {
+            continue;
+        }
+        for f in files {
+            let _ = std::fs::remove_file(&f);
+        }
+        removed += 1;
+        freed += bytes;
+        total -= bytes;
+    }
+    if removed == 0 {
+        return None;
+    }
+    Some(PruneReport { removed_groups: removed, freed_bytes: freed })
+}
+
+/// Throttled prune: called from session saves; does a real pass at most once
+/// every 5 minutes per process. Returns the report when something was deleted.
+pub fn maybe_prune(exclude_id: &str, max_bytes: u64) -> Option<PruneReport> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 5 * 60 * 1000 {
+        return None;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    prune(exclude_id, max_bytes)
+}
+
+/// Total bytes used by all session files (for the `/sessions` display).
+pub fn total_bytes() -> u64 {
+    let mut n = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir()) {
+        for e in rd.flatten() {
+            if let Ok(m) = e.path().metadata() {
+                if m.is_file() {
+                    n += m.len();
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Format a byte count human-readably (for info lines).
+pub fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 pub fn save(s: &Session) -> Result<()> {
@@ -175,6 +307,68 @@ mod tests {
         assert_eq!(g.plan.len(), 2);
         assert_eq!(g.plan[0].1, "active");
         assert!(!g.verified);
+    }
+
+    fn seed(id: &str, ext: &str, bytes: usize) {
+        std::fs::create_dir_all(dir()).unwrap();
+        std::fs::write(dir().join(format!("{id}{ext}")), vec![b'x'; bytes]).unwrap();
+    }
+
+    #[test]
+    fn prune_deletes_oldest_groups_whole() {
+        crate::config::with_temp_config_dir("prune", || {
+            // three sessions; group 100 has sidecars too
+            seed("100", ".json", 400);
+            seed("100", ".injection.log", 100);
+            seed("100", ".log.jsonl", 100);
+            seed("200", ".json", 400);
+            seed("300", ".json", 400);
+            // over a 900-byte budget → must drop the oldest group (100, 600 B)
+            let r = prune("300", 900).expect("prune should fire");
+            assert_eq!(r.removed_groups, 1);
+            assert_eq!(r.freed_bytes, 600);
+            assert!(!dir().join("100.json").exists());
+            assert!(!dir().join("100.injection.log").exists(), "sidecar must go with its group");
+            assert!(!dir().join("100.log.jsonl").exists());
+            assert!(dir().join("200.json").exists() && dir().join("300.json").exists());
+            // under budget now → no-op
+            assert!(prune("300", 900).is_none());
+        });
+    }
+
+    #[test]
+    fn prune_never_touches_the_live_session() {
+        crate::config::with_temp_config_dir("prune-live", || {
+            seed("100", ".json", 400);
+            seed("200", ".json", 400);
+            // budget below a single group: only the excluded one survives
+            let r = prune("100", 100).expect("must prune");
+            assert_eq!(r.removed_groups, 1);
+            assert!(dir().join("100.json").exists(), "live session was deleted!");
+            assert!(!dir().join("200.json").exists());
+        });
+    }
+
+    #[test]
+    fn progress_file_tracks_step_statuses() {
+        crate::config::with_temp_config_dir("progress", || {
+            write_progress(
+                "42",
+                &GoalState {
+                    text: "ship the thing".into(),
+                    plan: vec![
+                        ("first".into(), "done".into()),
+                        ("second".into(), "skipped".into()),
+                        ("third".into(), "pending".into()),
+                    ],
+                    verified: true,
+                },
+            );
+            let md = std::fs::read_to_string(dir().join("42.progress.md")).unwrap();
+            assert!(md.contains("- [x] first"));
+            assert!(md.contains("- [-] second"), "skipped must be visible, not silently done:\n{md}");
+            assert!(md.contains("- [ ] third"));
+        });
     }
 }
 

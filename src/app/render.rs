@@ -213,6 +213,11 @@ mod tests {
 
 pub fn render(app: &mut App, f: &mut Frame) {
     let area = f.area();
+    // Wipe cell *content* every frame, not just the background style: ratatui
+    // diffs against the previous buffer, so glyphs left by a finished
+    // screensaver entry (matrix-rain trails above all) would otherwise freeze
+    // on screen wherever the next entry draws nothing.
+    f.buffer_mut().reset();
     f.buffer_mut().set_style(area, Style::default().bg(OMARCHY.bg));
 
     if app.screensaving {
@@ -228,7 +233,14 @@ pub fn render(app: &mut App, f: &mut Frame) {
     if app.mode == Mode::Agent {
         // unified window: the agent owns the whole viewport below the status bar
         let sidebar_w: u16 = if area.width >= 108 { 32 } else { 0 };
-        let mcp_rows = app.mcp.lock().map(|r| r.panel_rows()).unwrap_or_default();
+        // Refresh from the registry only when its lock is free; while a tool
+        // call holds it, reuse the cached rows. A blocking lock() here used to
+        // stall every frame for the duration of MCP work (and forever once a
+        // wedged transport held it) — indistinguishable from a frozen program.
+        if let Ok(reg) = app.mcp.try_lock() {
+            app.mcp_rows_cache = reg.panel_rows();
+        }
+        let mcp_rows = app.mcp_rows_cache.clone();
         let left_has_content = !mcp_rows.is_empty() || !app.active_skills.is_empty();
         let left_w: u16 = if area.width >= 150 && left_has_content { 26 } else { 0 };
         let mut cons = Vec::new();
@@ -255,7 +267,6 @@ pub fn render(app: &mut App, f: &mut Frame) {
         render_shell(app, f, top[1]);
     }
     render_status(app, f, top[0]);
-
     if let Some(m) = &app.permission {
         let (sel, title, detail) = (m.sel, m.title.clone(), m.detail.clone());
         render_permission(f, area, sel, &title, &detail);
@@ -283,17 +294,22 @@ fn toggle_hint(agent: bool) -> String {
     }
 }
 
-fn render_status(app: &App, f: &mut Frame, area: Rect) {
+fn render_status(app: &mut App, f: &mut Frame, area: Rect) {
     let agent = app.mode == Mode::Agent;
-    let (ultra, unlimited, remote_label) = app
-        .env
-        .lock()
-        .map(|e| (
+    // Read env only when the lock is free and keep the last-known badges
+    // otherwise. The agent thread locks env for microseconds at a time — but
+    // it must never hold it across a user wait (the old gate_tool call did,
+    // and this per-frame lock froze with it). try_lock makes even a future
+    // regression a stale badge instead of a frozen terminal.
+    if let Ok(e) = app.env.try_lock() {
+        app.env_badge_cache = (
             e.ultra,
             e.unlimited_run,
             e.remote.as_ref().map(|r| r.label()),
-        ))
-        .unwrap_or((false, false, None));
+            e.work_mode == crate::agent::WorkMode::Plan,
+        );
+    }
+    let (ultra, unlimited, remote_label, planning) = app.env_badge_cache.clone();
     let mut spans = vec![
         Span::styled(" 🐧 PC ", Style::default().fg(OMARCHY.bg).bg(shimmer(app.tick)).add_modifier(Modifier::BOLD)),
         Span::styled("  ", Style::default()),
@@ -310,6 +326,10 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
     }
     if unlimited {
         spans.push(Span::styled(" ∞ UNLIMITED ", Style::default().fg(Color::Black).bg(OMARCHY.warn).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled("  ", Style::default()));
+    }
+    if planning {
+        spans.push(Span::styled(" 📋 PLAN · read-only ", Style::default().fg(Color::White).bg(OMARCHY.agent_line).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled("  ", Style::default()));
     }
     let ws_label = match &remote_label {
@@ -379,16 +399,19 @@ fn short_path(p: &str) -> String {
     }
 }
 
-fn model_of(app: &App) -> String {
-    let e = app.env.lock().unwrap();
-    let effort = e.reasoning_effort.clone();
-    match (&e.provider, e.model.is_empty()) {
-        (Some(p), false) => {
-            let badge = effort.map(|x| format!(" ·e:{x}")).unwrap_or_default();
-            format!("◆ {}·{}{badge}", p.name, crate::providers::truncate(&e.model, 24))
-        }
-        _ => "◆ no model — /providers".into(),
+fn model_of(app: &mut App) -> String {
+    // try_lock + cache — same freeze-proofing as the status badges above.
+    if let Ok(e) = app.env.try_lock() {
+        let effort = e.reasoning_effort.clone();
+        app.model_label_cache = match (&e.provider, e.model.is_empty()) {
+            (Some(p), false) => {
+                let badge = effort.map(|x| format!(" ·e:{x}")).unwrap_or_default();
+                format!("◆ {}·{}{badge}", p.name, crate::providers::truncate(&e.model, 24))
+            }
+            _ => "◆ no model — /providers".into(),
+        };
     }
+    app.model_label_cache.clone()
 }
 
 fn tcolor(c: crate::term::TColor, bold: bool, default: Color) -> Color {

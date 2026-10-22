@@ -2,6 +2,139 @@
 
 All notable changes to penguin command are documented here.
 
+## [0.5.0] — 2026-10-22
+
+### Fixed
+- **MCP tool calls no longer deadlock the whole terminal** — the agent's MCP
+  dispatch matched on `resolve()` while holding the registry mutex and locked
+  it again inside the match arm; since `std::sync::Mutex` is not reentrant,
+  every routed `mcp__…` call self-deadlocked the agent thread while it held
+  the lock, and the renderer (which locked the same mutex every frame) froze
+  behind it — forced closure only. Dispatch now resolves and calls under a
+  single lock hold (`Registry::dispatch`).
+- **Permission prompts no longer freeze the UI** — reading `work_mode` as a
+  call argument kept the env guard alive across the whole safety-gate call,
+  which parks on the user's answer; every per-frame status-bar `env.lock()`
+  then blocked forever. The mode is read into a local first (bug shipped with
+  plan/build modes).
+- **Wedged MCP servers can't hang writes** — writing to a stdio server's
+  stdin had no timeout: a child that stopped draining its input pipe blocked
+  `write_all` forever while the registry mutex was held. Writes now run on a
+  helper thread with a 10 s deadline; a timeout marks the transport dead and
+  reconnectable instead of freezing the session.
+- **Rendering is freeze-proof against lock regressions** — the MCP panel rows
+  and status-bar badges (model, plan/ultra/unlimited, remote) now refresh via
+  `try_lock()` with last-known-value caches, so no agent-side lock hold can
+  ever stall a frame again; worst case is one stale badge.
+- **Plan mode no longer misclassifies quoted text as writes** — the
+  read-only gate scanned raw strings, so a `>` inside quotes counted as an
+  output redirection: greps for C++ arrows (`(dev)->create`) or echo lines
+  containing `"NO -> …"` were hard-denied mid-plan. Command splitting is now
+  quote-aware (segments split on unquoted `| ; && ||` only, redirects count
+  only when unquoted), and inline interpreter scripts (`bash -c "…"`) are
+  scanned recursively so real writes inside them stay caught.
+- **Denial reasons reach the model** — a blocked tool call used to return a
+  generic "permission denied", hiding the actual policy reason (which the
+  user saw). The model now gets the verbatim reason, so plan-mode blocks
+  teach it to tell the user to run `/build` instead of silently exploring
+  forever or retrying.
+
+### Added
+- **Go-ahead dialog** — typing `go`, `do it`, `proceed` … in Plan mode no
+  longer dies as a plain read-only prompt: penguin asks whether to switch to
+  Build and execute the plan now; confirming flips the mode and immediately
+  commands execution of the pending request. `/build` with a plan or open
+  goal pending also auto-resumes execution instead of idling.
+- **`set_goal` tool** — multi-step tasks handed over in ordinary
+  conversation (not just via `/goal`) are now recorded as real goals:
+  `update_plan` attaches to them, auto-continuation arms, and `/continue`
+  resumes them after restarts.
+
+## [0.4.1] — 2026-10-20
+
+### Security
+- **Every tool result is injection-scanned** — previously only web fetches
+  were framed as untrusted data, and a logged autonomous run proved fake
+  directives (`[system message]`, `[系统注入]`, "reply with exactly one period")
+  flow through *local* command and file output too. Now every result that
+  re-enters the model — `run_command`, `read_file`, ssh echoes, background
+  job polls — passes one guard: multilingual injection phrasing is detected,
+  fake role markers are rewritten to `[fake-role-marker]` in place, a 🛡
+  untrusted-data warning is appended (without quoting the payload back), and
+  the event lands in the session injection log. From the third sighting in a
+  session the guard adds a silencer so recurring injections stop eating
+  turns — that one run spent twelve re-flagging the same block.
+- **Injection scanning is now channel-aware — no more false injections** —
+  the first guard version substring-matched every marker in *all* tool output,
+  so legitimate content tripped it: a tutorial saying "your task now", a chat
+  transcript containing `[assistant]`, or penguin editing its own source were
+  flagged, and worse, role markers were rewritten *inside file contents* the
+  model was about to edit — corrupting them. Now remote bytes (fetches, MCP)
+  keep the full destructive treatment; local output is only annotated, never
+  rewritten, and soft phrasing counts for remote channels only. The skip-if-🛡
+  heuristic (which any output quoting a shield emoji could exploit to disable
+  the guard) was replaced with an explicit internal sentinel appended by the
+  framing code. Payload loop-breakers likewise ignore prose: discussing a
+  `curl … | sh` attack no longer counts as sighting one.
+- **Obfuscated execution is hard-denied** — base64/base32-decoded content
+  piped into any shell or interpreter, and `eval $(… | base64 -d)`, join the
+  never-executed-not-even-with-ULTRA list.
+
+### Added
+- **Plan & build modes** — `/plan` arms a read-only mode: the system prompt
+  restricts the agent to research + `update_plan`, and the safety gate
+  hard-blocks file writes, permission changes, mutating commands and output
+  redirections (survives ULTRA). `/build` (`/work`) restores execution; a
+  `📋 PLAN · read-only` badge marks it in the status bar. Switching works
+  mid-run — the gate re-reads the mode per tool call.
+- **Per-session activity log** — every user prompt, assistant reply, tool
+  call, tool result, plan publish and denial is appended as JSON lines to
+  `sessions/<id>.log.jsonl` (`[logging] enabled`, `max_entry_bytes`; entries
+  truncated individually so one huge dump can't bloat it).
+- **Progress file** — each goal mirrors its plan to `sessions/<id>.progress.md`
+  on every save: a greppable `- [x]/[-]/[ ]` checklist that survives context
+  compaction and shows skipped steps honestly.
+- **2 GB storage budget** — `[storage] max_total_bytes` caps the sessions dir;
+  over budget, whole session groups (JSON + injection/activity/progress
+  sidecars) are pruned oldest-first at startup and during long runs, never the
+  live session. `/sessions` shows total usage against the cap.
+
+### Fixed
+- **Goals declaring victory with steps still open** — `finish_goal` used to
+  mark every plan step done unconditionally, so "finished" sessions shipped
+  half-checked lists. It is now refused once with the list of unfinished steps
+  (complete them, mark them failed, or re-call it only with real evidence);
+  accepted goals record leftovers as `skipped` instead of lying. Auto-continue
+  nudges name the pending steps explicitly, and a plain prompt typed while a
+  goal is unverified now attaches to that goal — "finish the rest" keeps the
+  loop armed instead of dying after one text reply.
+- **Screensaver leftovers** — frames only restyled the background instead of
+  clearing cell contents, so matrix-rain trails froze mid-fade and bled into
+  the next entry (and after waking). Every frame now renders from a clean
+  buffer; rain trails fade to true black.
+- **Lightning that behaves like lightning** — bolts no longer pop into
+  existence as a three-frame strobe: each strike now crawls down the screen
+  in ~4 frames with a blazing leader head shedding spark particles, peels
+  off diagonal forks (with occasional twigs) as it descends, flashes on
+  ground impact and dims away.
+
+### Added
+- **Aurora streams scene** — a new screensaver mode where the whole sky runs
+  with flowing aurora curtains: three ribbons of ray striations drifting at
+  different speeds shear across the screen, stars twinkle through the gaps,
+  and one penguin watches from the ice. The shared background aurora in all
+  outdoor scenes got the same streaming-curtain engine.
+
+### Changed
+- **Shimmer sweep retired** — it was a near-duplicate of wave sway; its
+  white specular band now sweeps through wave sway itself, keeping the pool
+  at nine entries with aurora streams added.
+- **Benign shell noise is stripped by default** — the nvm/npmrc
+  `globalconfig`/`prefix` warning fired on *every* login-shell command (179×
+  in one session) and cost tokens each time. `[shell] strip_noise = true`
+  (default) drops it line-wise; disable or extend via
+  `[shell] noise_patterns = [...]`.
+
 ## [0.4.0] — 2026-10-17
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "penguin-command"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "A terminal with a built-in AI agent — works inside any terminal, on any OS."
 license = "MIT"

@@ -138,6 +138,15 @@ pub struct App {
     mcp: Arc<Mutex<crate::mcp::Registry>>,
     /// Candidates from the last `/mcp import` scan, for `/mcp import 1,3`.
     mcp_import_cache: Vec<crate::mcp::importer::Candidate>,
+    /// Last MCP panel rows, refreshed when the registry lock is free. Render
+    /// never blocks on it: a tool call holding the lock (up to its timeout)
+    /// must not be able to freeze every frame — that looked like a hang.
+    mcp_rows_cache: Vec<(String, &'static str, usize, bool)>,
+    /// Same idea for AgentEnv reads in the status bar: refreshed when the env
+    /// lock is free (the agent thread must never hold it across a user wait —
+    /// an old gate_tool call did, and every frame's env.lock() froze on it).
+    env_badge_cache: (bool, bool, Option<String>, bool),
+    model_label_cache: String,
     /// Skills loaded via `load_skill` during this session (insertion order),
     /// shown live in the left panel.
     pub active_skills: Vec<String>,
@@ -157,6 +166,9 @@ pub struct App {
     pub turn_tools: usize,
     /// Last submitted prompt, for /retry after a failed turn.
     last_prompt: Option<(String, bool)>,
+    /// Receiver for the Plan-mode go-ahead dialog (see open_go_ahead); polled
+    /// each tick in drain_agent_events.
+    go_ahead_rx: Option<Receiver<Option<String>>>,
     /// Instructions typed while the agent is mid-run. Shared with the agent
     /// thread, which injects them at iteration boundaries; whatever is left
     /// when a turn ends (aborts, plain chat) flushes one-per-turn from here.
@@ -237,8 +249,9 @@ impl App {
                  /limit off|on remove/restore run-length caps · \
                  /search <q> web search (sandboxed page reader) · \
                   /new fresh session · /sessions pick from a menu · /resume [id] · /skills list saved skills · \
-                 /compact compact context now · /retry resend last prompt · /effort cycle reasoning depth · \
-                 /context usage · /ultra bypass approvals (dangerous) · /providers setup UI · /model [name] · \
+                  /compact compact context now · /retry resend last prompt · /effort cycle reasoning depth · \
+                  /plan read-only planning mode · /build back to full execution · \
+                  /context usage · /ultra bypass approvals (dangerous) · /providers setup UI · /model [name] · \
                  /workspace <dir> · /ssh attach|detach|status ride the active ssh session · \
                  /mcp MCP servers (status/add/import) · /screensaver · /clear · /quit",
                 env!("CARGO_PKG_VERSION")
@@ -330,6 +343,27 @@ impl App {
                     )));
                 }
             }
+            "plan" => {
+                self.env.lock().unwrap().work_mode = crate::agent::WorkMode::Plan;
+                self.transcript.push(Entry::Info(format!(
+                    "📋 {} MODE — read-only: file writes, permission changes and mutating commands \
+                     are hard-blocked. Research and design freely; /build switches back to full \
+                     execution.",
+                    crate::agent::WorkMode::Plan.label().to_uppercase()
+                )));
+            }
+            "build" | "work" => {
+                let pending = !self.plan.is_empty() || (self.active_goal.is_some() && !self.goal_verified);
+                if pending && !self.busy {
+                    self.switch_to_build_and_execute();
+                } else {
+                    self.env.lock().unwrap().work_mode = crate::agent::WorkMode::Build;
+                    self.transcript.push(Entry::Info(format!(
+                        "🔨 {} MODE — full capabilities restored.",
+                        crate::agent::WorkMode::Build.label().to_uppercase()
+                    )));
+                }
+            }
             "providers" | "provider" => self.setup_interactive()?,
             "new" => {
                 if self.busy {
@@ -352,6 +386,11 @@ impl App {
             }
             "sessions" | "history" => {
                 let list = session::list();
+                self.transcript.push(Entry::Info(format!(
+                    "💾 sessions use {} of the {} budget",
+                    session::fmt_bytes(session::total_bytes()),
+                    session::fmt_bytes(self.cfg.storage.max_total_bytes())
+                )));
                 if list.is_empty() {
                     self.transcript.push(Entry::Info("no saved sessions yet".into()));
                 } else {
@@ -585,6 +624,7 @@ impl App {
     }
 
     fn drain_agent_events(&mut self) {
+        self.poll_go_ahead();
         let mut events = Vec::new();
         let mut dead = false;
         if let Some(rx) = &self.agent_ev {
@@ -652,6 +692,11 @@ impl App {
                     self.transcript.push(Entry::Diff { path, added, removed, text });
                 }
                 AgentEvent::Plan(steps) => self.plan = steps,
+                AgentEvent::GoalSet { text } => {
+                    self.active_goal = Some(text.clone());
+                    self.goal_verified = false;
+                    self.transcript.push(Entry::Info(format!("🎯 goal: {}", crate::providers::truncate(&text, 100))));
+                }
                 AgentEvent::NeedPermission { title, detail, tx, .. } => {
                     self.permission = Some(PermModal { title, detail, tx, sel: 0 });
                 }
@@ -1155,10 +1200,61 @@ impl App {
                 q.len()
             };
             self.transcript.push(Entry::Info(format!("⏳ queued ({n}) — injected at the agent's next step")));
+        } else if self.env.lock().unwrap().work_mode == crate::agent::WorkMode::Plan && is_go_ahead(&text) {
+            self.open_go_ahead();
         } else {
             self.send_prompt(text, false);
         }
         Ok(())
+    }
+
+    /// Plan mode is read-only; a bare go-ahead ("go", "do it") means the user
+    /// wants execution — ask whether to flip to Build now instead of silently
+    /// staying in planning.
+    fn open_go_ahead(&mut self) {
+        let (tx, rx) = channel::<Option<String>>();
+        self.go_ahead_rx = Some(rx);
+        self.question = Some(QuestionModal {
+            question: "Planning is read-only — switch to Build and execute the plan now?".into(),
+            options: vec!["🔨 Switch to Build & execute".into(), "Stay in Plan (keep refining)".into()],
+            tx,
+            sel: 0,
+            typing: false,
+            buf: String::new(),
+        });
+    }
+
+    /// Collect the go-ahead dialog's answer (set by open_go_ahead).
+    fn poll_go_ahead(&mut self) {
+        let ans = match &self.go_ahead_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(a) => Some(a),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            },
+            None => return,
+        };
+        self.go_ahead_rx = None;
+        let Some(answer) = ans else { return };
+        if answer.as_deref().is_some_and(|a| a.starts_with("🔨")) {
+            self.switch_to_build_and_execute();
+        } else if let Some(a) = answer.filter(|a| !a.is_empty() && !a.starts_with("Stay")) {
+            // A custom answer is an ordinary Plan-mode message.
+            self.send_prompt(a, false);
+        }
+    }
+
+    /// Flip to Build mode and immediately tell the agent to execute the plan.
+    fn switch_to_build_and_execute(&mut self) {
+        self.env.lock().unwrap().work_mode = crate::agent::WorkMode::Build;
+        let base = self.last_prompt.clone().map(|(t, _)| t).unwrap_or_default();
+        let msg = if base.trim().is_empty() {
+            "User approved the plan — execute it now.".to_string()
+        } else {
+            format!("User approved — execute the plan for this request now:\n{base}")
+        };
+        self.transcript.push(Entry::Info("🔨 BUILD MODE — full capabilities restored; executing.".into()));
+        self.send_prompt(msg, false);
     }
 
     fn enqueue_instruction(&mut self, text: String) {
@@ -1177,6 +1273,22 @@ fn provider_window(cfg: &Config) -> usize {
     cfg.active().and_then(|p| p.context_window).unwrap_or(32_768)
 }
 
+/// Short go-ahead phrases that mean "stop planning, start executing" when
+/// typed in Plan mode. Punctuation and casing are ignored.
+fn is_go_ahead(text: &str) -> bool {
+    let t = text
+        .trim()
+        .to_lowercase()
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+        .to_string();
+    matches!(
+        t.as_str(),
+        "go" | "go ahead" | "do it" | "do them" | "proceed" | "start" | "begin" | "implement"
+            | "build it" | "execute" | "run it" | "yes" | "yep" | "ok" | "okay" | "lgtm"
+            | "lets go" | "let's go" | "ship it"
+    )
+}
+
 fn short_output(o: &str) -> String {
     let lines: Vec<&str> = o.lines().collect();
     if lines.len() <= 6 {
@@ -1189,6 +1301,8 @@ fn short_output(o: &str) -> String {
 pub fn run(opts: Options) -> Result<()> {
     let mut cfg = Config::load().unwrap_or_default();
     cfg.normalize();
+    crate::agent::tools::configure_shell_noise(cfg.shell.strip_noise(), &cfg.shell.noise_patterns);
+    crate::log::configure(cfg.logging.enabled(), cfg.logging.max_entry_bytes());
     if opts.ultra {
         cfg.agent.ultra = true;
     }
@@ -1252,8 +1366,10 @@ pub fn run(opts: Options) -> Result<()> {
         ultra: cfg.agent.ultra,
         unlimited_run: cfg.agent.unlimited_run,
         mcp: mcp.clone(),
+        work_mode: crate::agent::WorkMode::Build,
         remote: None,
     }));
+    let session_id = env.lock().unwrap().session_id.clone();
     let queue: crate::agent::InstructionQueue = Arc::new(Mutex::new(Vec::new()));
     let (handle, agent_ev) = crate::agent::spawn_agent(env.clone(), cfg.clone(), queue.clone());
 
@@ -1297,6 +1413,9 @@ pub fn run(opts: Options) -> Result<()> {
         saver_start: 0,
         mcp,
         mcp_import_cache: Vec::new(),
+        mcp_rows_cache: Vec::new(),
+        env_badge_cache: (false, false, None, false),
+        model_label_cache: String::new(),
         active_skills: Vec::new(),
         ssh_hinted: false,
         shell_pid,
@@ -1310,9 +1429,21 @@ pub fn run(opts: Options) -> Result<()> {
         activity: None,
         turn_tools: 0,
         last_prompt: None,
+        go_ahead_rx: None,
         queued: queue,
         expand_tools: false,
     };
+
+    // Startup storage check: drop oldest session groups if the sessions dir
+    // has grown past [storage] max_total_bytes (never the live session).
+    if let Some(r) = session::prune(&session_id, cfg.storage.max_total_bytes()) {
+        app.transcript.push(Entry::Info(format!(
+            "🧹 storage over {} — pruned {} oldest session(s), freed {}",
+            session::fmt_bytes(cfg.storage.max_total_bytes()),
+            r.removed_groups,
+            session::fmt_bytes(r.freed_bytes)
+        )));
+    }
 
     if opts.cont_last {
         match session::latest() {
@@ -1816,7 +1947,17 @@ fn handle_agent_key(app: &mut App, k: &event::KeyEvent) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_paste;
+    use super::{is_go_ahead, sanitize_paste};
+
+    #[test]
+    fn go_ahead_phrases_detected() {
+        for t in ["go", "Go!", "  do it ", "proceed.", "yes", "let's go", "ship it", "OK"] {
+            assert!(is_go_ahead(t), "{t} should be a go-ahead");
+        }
+        for t in ["go on about the architecture", "not yet", "what is go?", "/build", "please run the tests first and tell me"] {
+            assert!(!is_go_ahead(t), "{t} must not trigger the dialog");
+        }
+    }
 
     #[test]
     fn paste_normalizes_newlines_and_tabs() {

@@ -15,6 +15,12 @@ use std::time::Duration;
 /// Keep the last N bytes of server stderr for error messages.
 const STDERR_TAIL: usize = 2048;
 
+/// Deadline for writing one message to the server's stdin. A child that has
+/// wedged and stopped draining stdin would block `write_all` forever (pipe
+/// buffers fill at ~64 KiB) — and since callers hold the registry mutex while
+/// calling us, that froze the whole UI with no timeout to save it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// One-shot reply channel handed to the reader thread per in-flight request.
 type Reply = Sender<std::result::Result<Value, String>>;
 
@@ -129,9 +135,37 @@ impl StdioClient {
         }
         let mut line = serde_json::to_string(msg)?;
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).map_err(|e| anyhow!("transport write failed: {e}"))?;
-        self.stdin.flush().map_err(|e| anyhow!("transport write failed: {e}"))?;
-        Ok(())
+        // Write on a helper thread with a deadline: a wedged child that stops
+        // reading stdin would otherwise block us forever while the registry
+        // mutex is held (see WRITE_TIMEOUT). On timeout the transport is
+        // marked dead — callers treat "transport" errors as reconnectable —
+        // and the parked writer thread stays blocked on the full pipe until
+        // process exit, leaking one thread but never the UI.
+        let stdin = std::mem::replace(&mut self.stdin, Box::new(std::io::sink()));
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut w = stdin;
+            let res = w.write_all(line.as_bytes()).and_then(|_| w.flush());
+            let _ = tx.send((res.map_err(|e| e.to_string()), w));
+        });
+        match rx.recv_timeout(WRITE_TIMEOUT) {
+            Ok((Ok(()), w)) => {
+                self.stdin = w;
+                Ok(())
+            }
+            Ok((Err(e), w)) => {
+                self.stdin = w;
+                self.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                Err(anyhow!("transport write failed: {e}"))
+            }
+            Err(_) => {
+                self.alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                Err(anyhow!(
+                    "transport stalled: server not reading stdin for {}s (write timed out)",
+                    WRITE_TIMEOUT.as_secs()
+                ))
+            }
+        }
     }
 
     pub fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {

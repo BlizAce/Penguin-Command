@@ -294,6 +294,66 @@ pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
 }
 
+/// Shell output hygiene. Command output is fed straight to the model, so
+/// known-benign startup chatter (e.g. the nvm/npmrc `globalconfig`/`prefix`
+/// warning, which fired on *every* command in one logged session) is stripped
+/// line-wise before it costs tokens.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// Strip built-in noise patterns from command output (default true).
+    pub strip_noise: Option<bool>,
+    /// Extra regex patterns to strip, in addition to the built-ins.
+    pub noise_patterns: Vec<String>,
+}
+
+impl ShellConfig {
+    pub fn strip_noise(&self) -> bool {
+        self.strip_noise.unwrap_or(true)
+    }
+}
+
+/// Per-session activity logging: every user prompt, assistant reply, tool
+/// call and tool result is appended to `sessions/<id>.log.jsonl`. Entries are
+/// truncated individually so one giant tool dump can't bloat the log; overall
+/// disk use is bounded by `[storage]` pruning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// Write the JSONL activity log (default true).
+    pub enabled: Option<bool>,
+    /// Per-entry truncation cap in bytes (default 8192, min 512).
+    pub max_entry_bytes: Option<usize>,
+}
+
+impl LoggingConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+    pub fn max_entry_bytes(&self) -> usize {
+        self.max_entry_bytes.unwrap_or(8192).max(512)
+    }
+}
+
+/// Disk budget for penguin's data dir (sessions, injection logs, activity
+/// logs, progress files). When the total exceeds the cap, whole session
+/// groups are deleted oldest-first until it fits — never the live session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Total budget in bytes (default 2 GB). Values ≤ 0 fall back to default.
+    pub max_total_bytes: Option<u64>,
+}
+
+/// Default storage budget: 2 GB.
+pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 2_000_000_000;
+
+impl StorageConfig {
+    pub fn max_total_bytes(&self) -> u64 {
+        self.max_total_bytes.filter(|n| *n > 0).unwrap_or(DEFAULT_MAX_TOTAL_BYTES)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -312,6 +372,9 @@ pub struct Config {
     pub web: WebConfig,
     pub mcp: McpConfig,
     pub ui: UiConfig,
+    pub shell: ShellConfig,
+    pub logging: LoggingConfig,
+    pub storage: StorageConfig,
     pub rules: Vec<Rule>,
 }
 
@@ -623,5 +686,32 @@ mod tests {
         let back: Config = toml::from_str(&txt).unwrap();
         assert!(!back.web.enabled());
         assert_eq!(back.web.max_results(), 3);
+    }
+
+    #[test]
+    fn logging_and_storage_defaults() {
+        let c = Config::default();
+        // activity logging ships on; storage budget defaults to 2 GB
+        assert!(c.logging.enabled());
+        assert_eq!(c.logging.max_entry_bytes(), 8192);
+        assert_eq!(c.storage.max_total_bytes(), DEFAULT_MAX_TOTAL_BYTES);
+        // zero/nonsense values fall back, tiny entry caps clamp up
+        let mut c = Config::default();
+        c.storage.max_total_bytes = Some(0);
+        assert_eq!(c.storage.max_total_bytes(), DEFAULT_MAX_TOTAL_BYTES);
+        c.logging.max_entry_bytes = Some(10);
+        assert_eq!(c.logging.max_entry_bytes(), 512);
+    }
+
+    #[test]
+    fn logging_storage_sections_roundtrip_through_toml() {
+        let mut c = Config::default();
+        c.logging.enabled = Some(false);
+        c.storage.max_total_bytes = Some(1_234_567_890);
+        let txt = toml::to_string_pretty(&c).unwrap();
+        assert!(txt.contains("[logging]") && txt.contains("[storage]"), "toml was: {txt}");
+        let back: Config = toml::from_str(&txt).unwrap();
+        assert!(!back.logging.enabled());
+        assert_eq!(back.storage.max_total_bytes(), 1_234_567_890);
     }
 }

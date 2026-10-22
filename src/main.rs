@@ -4,6 +4,7 @@ mod config;
 mod diff;
 mod environment;
 mod integration;
+mod log;
 mod mcp;
 mod penguin;
 mod providers;

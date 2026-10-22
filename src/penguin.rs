@@ -135,10 +135,11 @@ pub fn victory_lines() -> Vec<String> {
 // scenes, auto-cycled by an inverse-frequency picker; any key exits).
 // ---------------------------------------------------------------------------
 
-pub const SCENE_COUNT: usize = 3;
-pub const EFFECT_COUNT: usize = 6;
+pub const SCENE_COUNT: usize = 4;
+pub const EFFECT_COUNT: usize = 5;
 /// Pool entries: 0..SCENE_COUNT are penguin scenes, the rest are wordmark
-/// effects (see `render_screensaver`).
+/// effects (see `render_screensaver`). Shimmer sweep was retired as a near
+/// duplicate of wave sway — its specular band now rides along inside it.
 pub const ENTRY_COUNT: usize = SCENE_COUNT + EFFECT_COUNT;
 
 pub fn entry_name(entry: usize) -> &'static str {
@@ -146,20 +147,20 @@ pub fn entry_name(entry: usize) -> &'static str {
         0 => "blizzard stroll",
         1 => "aurora ridge",
         2 => "belly slide",
-        3 => "matrix rain",
-        4 => "scramble decode",
-        5 => "glitch",
-        6 => "wave sway",
-        7 => "fire glow",
-        _ => "shimmer sweep",
+        3 => "aurora streams",
+        4 => "matrix rain",
+        5 => "scramble decode",
+        6 => "glitch",
+        7 => "wave sway",
+        _ => "fire glow",
     }
 }
 
 /// How long each entry holds the screen before the picker rotates, in ticks
-/// (~30fps while screensaving). Scramble gets the longest window: its reveal
-/// is the show.
+/// (~30fps while screensaving). Scramble gets a long window: its reveal is
+/// the show; aurora streams lingers so the curtains can cross the sky.
 pub fn entry_duration(entry: usize) -> u32 {
-    const DURATIONS: [u32; ENTRY_COUNT] = [540, 600, 420, 600, 540, 360, 540, 540, 480];
+    const DURATIONS: [u32; ENTRY_COUNT] = [540, 600, 420, 660, 600, 540, 360, 540, 540];
     DURATIONS[entry % ENTRY_COUNT]
 }
 
@@ -370,80 +371,265 @@ fn snow(f: &mut Frame, area: Rect, tick: u32, density: u32) {
     }
 }
 
-/// A colourful aurora band across the top of the sky — painted behind every
-/// outdoor penguin scene. Green↔teal ribbons cross-fade into violet, drifting
-/// with time; `dim` scales brightness for stormier scenes.
-fn aurora_sky(f: &mut Frame, area: Rect, tick: u32, dim: f64) {
-    let band = ((area.height as f64 * 0.34) as u16).clamp(4, 12);
+/// Streaming-curtain aurora: intensity 0..1 of the brightest ribbon at sky
+/// coordinate (x, y) inside a `band`-row sky, plus the ribbon index (drives
+/// hue). Each ribbon is a meandering centreline with hard vertical falloff,
+/// and its ray striations ride a horizontal flow — different speeds per
+/// ribbon shear the curtains so they visibly *stream across the sky* instead
+/// of pulsing in place.
+fn curtain(x: u16, y: u16, tick: u32, band: u16) -> (f64, usize) {
+    let xf = x as f64;
+    let yf = y as f64;
+    let t = tick as f64;
+    let bandf = band.max(1) as f64;
+    let mut best = 0.0f64;
+    let mut ribbon = 0usize;
+    for r in 0..3usize {
+        let ph = r as f64 * 2.1;
+        // Flow coordinate: shifting x by t*speed slides the whole pattern
+        // sideways; per-ribbon speeds create shear between the curtains.
+        let u = xf - t * (0.28 + 0.07 * r as f64);
+        let centre = bandf * (0.30 + 0.17 * r as f64)
+            + bandf * 0.14 * (u * 0.045 + t * 0.018 + ph).sin()
+            + bandf * 0.08 * (u * 0.021 - t * 0.031 + ph * 1.7).sin();
+        let dy = yf - centre;
+        // Sharp-ish top edge, long wispy rays hanging below.
+        let vert = if dy < 0.0 {
+            (-dy * dy / 2.6).exp()
+        } else {
+            (-dy / (bandf * 0.30 + 1.0)).exp()
+        };
+        if vert < 0.02 {
+            continue;
+        }
+        // Vertical ray striations, drifting with the flow like searchlights.
+        let ray = 0.5 + 0.5 * (u * 0.8 + 3.0 * (u * 0.11).sin() + t * 0.13 + ph * 5.0).sin();
+        let v = vert * (0.30 + 0.70 * ray * ray);
+        if v > best {
+            best = v;
+            ribbon = r;
+        }
+    }
+    (best.clamp(0.0, 1.0), ribbon)
+}
+
+/// Ribbon base colours: auroral green → teal → violet.
+const CURTAIN_HUES: [(u8, u8, u8); 3] = [
+    (0x4d, 0xf2, 0x8c),
+    (0x50, 0xe6, 0xc8),
+    (0xb4, 0x8c, 0xf5),
+];
+
+/// Paint the streaming curtains over the top `band` rows of `area`.
+/// `dim` scales brightness for stormier scenes; cells below the visibility
+/// floor are left untouched so stars behind them keep shining.
+fn paint_curtains(f: &mut Frame, area: Rect, tick: u32, band: u16, dim: f64) {
     for y in 0..band {
         for x in 0..area.width {
-            let v = ((x as f64 * 0.11 + (y as f64) * 0.35 + tick as f64 * 0.07).sin()
-                + (x as f64 * 0.05 - tick as f64 * 0.045).sin())
-                / 2.0;
-            if v <= 0.1 {
+            let (v, r) = curtain(x, y, tick, band);
+            if v < 0.08 {
                 continue;
             }
-            let t = ((v - 0.1) / 0.9).min(1.0);
-            let s1 = 0.5 + 0.5 * (x as f64 * 0.02 + tick as f64 * 0.018).sin();
-            let s2 = 0.5 + 0.5 * (x as f64 * 0.007 - tick as f64 * 0.011).sin();
-            let r0 = mix(0x4d, 0x57, s1);
-            let g0 = mix(0xf2, 0xc6, s1);
-            let b0 = mix(0x8c, 0xe8, s1);
-            let r = mix(r0, 0xb4, s2 * 0.75);
-            let g = mix(g0, 0x8c, s2 * 0.75);
-            let b = mix(b0, 0xf5, s2 * 0.75);
-            let ch = if v > 0.8 { '▓' } else if v > 0.5 { '▒' } else { '░' };
-            put(
-                f,
-                area,
-                x,
-                y + area.y,
-                ch,
-                Style::default().fg(Color::Rgb(mix(0x12, r, t * dim), mix(0x12, g, t * dim), mix(0x16, b, t * dim))),
-            );
+            let t = ((v - 0.08) / 0.92).min(1.0);
+            let (hr, hg, hb) = CURTAIN_HUES[r];
+            // Crests bleach toward white like a bright auroral arc.
+            let crest = (t * t * 0.55).min(0.8);
+            let r8 = mix(mix(0x12, hr, t), 0xf5, crest);
+            let g8 = mix(mix(0x12, hg, t), 0xff, crest);
+            let b8 = mix(mix(0x16, hb, t), 0xf8, crest);
+            let (r8, g8, b8) = if dim >= 1.0 {
+                (r8, g8, b8)
+            } else {
+                (mix(0x12, r8, dim), mix(0x12, g8, dim), mix(0x16, b8, dim))
+            };
+            let ch = if v > 0.75 {
+                '█'
+            } else if v > 0.5 {
+                '▓'
+            } else if v > 0.28 {
+                '▒'
+            } else {
+                '░'
+            };
+            put(f, area, x, y + area.y, ch, Style::default().fg(Color::Rgb(r8, g8, b8)));
         }
     }
 }
 
-/// A jagged lightning bolt strikes every `cycle` ticks: a flash-dim-flash
-/// strobe over three frames. Deterministic per strike so the bolt holds its
-/// shape while it flashes, then walks to a new position next strike.
-fn lightning(f: &mut Frame, area: Rect, tick: u32, ground_y: u16, cycle: u32) {
-    let idx = tick / cycle;
-    let phase = tick % cycle;
-    if phase > 2 {
-        return;
-    }
+/// A colourful aurora band across the top of the sky — painted behind every
+/// outdoor penguin scene. Streaming green↔teal↔violet curtains; `dim` scales
+/// brightness for stormier scenes.
+fn aurora_sky(f: &mut Frame, area: Rect, tick: u32, dim: f64) {
+    let band = ((area.height as f64 * 0.34) as u16).clamp(4, 14);
+    paint_curtains(f, area, tick, band, dim);
+}
+
+/// One deterministic bolt for strike `idx`: a jittering main channel from sky
+/// to ground plus diagonal forks (with occasional twigs). Geometry depends
+/// only on `idx`, so the bolt holds its shape while it crawls down; every
+/// strike gets a fresh shape.
+struct Bolt {
+    chan: Vec<(u16, u16)>,
+    forks: Vec<Vec<(u16, u16)>>,
+}
+
+fn build_bolt(area: Rect, ground_y: u16, idx: u32) -> Bolt {
     let h = hash(idx, 717);
     let span = (area.width / 2).max(1) as u32;
+    let max_x = (area.x + area.width).saturating_sub(1);
     let mut x = area.x + area.width / 8 + ((h >> 4) % span) as u16;
-    let bright = match phase {
-        0 => 1.0,
-        1 => 0.35,
-        _ => 0.7,
-    };
-    let style = Style::default()
-        .fg(Color::Rgb(mix(0x12, 0xf5, bright), mix(0x14, 0xf8, bright), mix(0x20, 0xff, bright)))
-        .add_modifier(Modifier::BOLD);
+    let mut chan = Vec::new();
+    let mut forks: Vec<Vec<(u16, u16)>> = Vec::new();
     let mut y = area.y;
     while y < ground_y.saturating_sub(1) {
-        put(f, area, x, y, '│', style);
+        chan.push((x, y));
         let d = hash(idx ^ 0x5EED, y as u32);
         match d % 4 {
-            0 => x = x.saturating_add(1),
+            0 => x = x.saturating_add(1).min(max_x),
             1 => x = x.saturating_sub(1),
             _ => {}
         }
-        if d % 23 == 7 && y + 2 < ground_y {
-            let dir: i32 = if d % 46 == 7 { 1 } else { -1 };
-            for k in 1..=2i32 {
-                let fx = x as i32 + dir * k;
-                if fx >= area.x as i32 && fx < (area.x + area.width) as i32 {
-                    put(f, area, fx as u16, y - 1, '─', style);
+        // A few times per strike a branch peels off and runs diagonally down.
+        if d % 9 == 2 && y + 3 < ground_y {
+            let dir: i32 = if d % 18 == 2 { 1 } else { -1 };
+            let len = 3 + ((d >> 6) % 4) as usize;
+            let mut fx = x as i32;
+            let mut fy = y;
+            let mut br = Vec::new();
+            for _ in 0..len {
+                fx += dir;
+                fy += 1;
+                if fx < area.x as i32 || fx > max_x as i32 || fy >= ground_y.saturating_sub(1) {
+                    break;
                 }
+                br.push((fx as u16, fy));
+                // Once per strike: a twig off the branch.
+                if br.len() == 2 && hash(idx ^ 0xABCD, fy as u32 * 3 + 1) % 7 == 0 {
+                    for _ in 0..2 {
+                        fx += dir;
+                        fy += 1;
+                        if fx < area.x as i32 || fx > max_x as i32 || fy >= ground_y.saturating_sub(1) {
+                            break;
+                        }
+                        br.push((fx as u16, fy));
+                    }
+                }
+            }
+            if !br.is_empty() {
+                forks.push(br);
             }
         }
         y += 1;
+    }
+    Bolt { chan, forks }
+}
+
+/// Stroke character matching the step from x0 to x1 (next row below).
+fn stroke(x0: u16, x1: u16) -> char {
+    if x1 > x0 {
+        '╲'
+    } else if x1 < x0 {
+        '╱'
+    } else {
+        '│'
+    }
+}
+
+/// Lightning that behaves like lightning: the bolt *crawls* down the screen
+/// over a few ticks — a blazing leader head shedding spark particles, forking
+/// off as it descends — then flashes on ground impact and dims away. The
+/// geometry is deterministic per strike index; between strikes it's random.
+fn lightning(f: &mut Frame, area: Rect, tick: u32, ground_y: u16, cycle: u32) {
+    const CRAWL: u32 = 4; // ticks for the leader to reach the ground
+    const FLASH: u32 = 2; // impact-flash frames
+    const GLOW: u32 = 3; // afterglow fade frames
+    let idx = tick / cycle;
+    let phase = tick % cycle;
+    if phase >= CRAWL + FLASH + GLOW {
+        return;
+    }
+    let bolt = build_bolt(area, ground_y, idx);
+    if bolt.chan.is_empty() {
+        return;
+    }
+    // ceil division: the leader reaches the ground within CRAWL ticks.
+    let rows_per_tick = (bolt.chan.len() as u32).div_ceil(CRAWL);
+    let revealed = (((phase + 1) * rows_per_tick).min(bolt.chan.len() as u32)) as usize;
+    let landed = phase >= CRAWL;
+    let bright: f64 = if !landed {
+        1.0
+    } else {
+        match phase - CRAWL {
+            0 | 1 => 0.85,
+            k => (0.5 / k as f64).min(0.4),
+        }
+    };
+    let style = |b: f64| {
+        Style::default()
+            .fg(Color::Rgb(mix(0x12, 0xf5, b), mix(0x14, 0xf8, b), mix(0x20, 0xff, b)))
+            .add_modifier(Modifier::BOLD)
+    };
+
+    // Main channel up to the leader.
+    for i in 0..revealed {
+        let (x, y) = bolt.chan[i];
+        let c = if i + 1 < bolt.chan.len() { stroke(x, bolt.chan[i + 1].0) } else { '│' };
+        put(f, area, x, y, c, style(bright));
+    }
+    // Forks reveal as the leader passes their row.
+    let head_y = bolt.chan[revealed - 1].1;
+    for br in &bolt.forks {
+        for (i, (fx, fy)) in br.iter().enumerate() {
+            if *fy > head_y {
+                continue;
+            }
+            let c = if i + 1 < br.len() {
+                stroke(*fx, br[i + 1].0)
+            } else if i > 0 {
+                stroke(br[i - 1].0, *fx)
+            } else {
+                '─'
+            };
+            put(f, area, *fx, *fy, c, style(bright * 0.8));
+        }
+    }
+
+    if !landed {
+        // Spark particles shedding off the descending leader.
+        let (hx, hy) = bolt.chan[revealed - 1];
+        const SPARKS: [char; 5] = ['·', '*', '✦', '˙', '+'];
+        for k in 0..6u32 {
+            let p = hash(idx.wrapping_mul(31).wrapping_add(tick), k);
+            let dx = ((p % 7) as i32) - 3;
+            let dy = (((p >> 4) % 7) as i32) - 3;
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let px = hx as i32 + dx;
+            let py = hy as i32 + dy;
+            if px < area.x as i32 || py < area.y as i32 {
+                continue;
+            }
+            put(f, area, px as u16, py as u16, SPARKS[(k as usize) % SPARKS.len()], style(0.75));
+        }
+        // The leader itself: a hot white core.
+        put(f, area, hx, hy, '*', Style::default().fg(Color::Rgb(0xff, 0xff, 0xff)).add_modifier(Modifier::BOLD));
+    } else {
+        // Ground impact: sparks skitter outward along the snow.
+        let (hx, _) = bolt.chan[bolt.chan.len() - 1];
+        let spread = ((phase - CRAWL) * 3) as i32;
+        const SPARKS: [char; 3] = ['·', '✦', '*'];
+        for k in 0..8u32 {
+            let p = hash(idx ^ 0xF1A5, phase * 8 + k);
+            let dir: i32 = if k % 2 == 0 { 1 } else { -1 };
+            let d = 1 + ((p % 4) as i32) + spread;
+            let px = hx as i32 + dir * d;
+            let py = ground_y.saturating_sub(1 + ((p >> 6) % 2) as u16);
+            if px < area.x as i32 || px >= (area.x + area.width) as i32 {
+                continue;
+            }
+            put(f, area, px as u16, py, SPARKS[k as usize % SPARKS.len()], style(0.9));
+        }
     }
 }
 
@@ -498,6 +684,32 @@ fn scene_aurora(f: &mut Frame, area: Rect, tick: u32) {
     }
 }
 
+/// Scene 3 — aurora streams: the whole sky runs with flowing curtains of
+/// light. Stars twinkle through gaps in the rays; a lone penguin watches from
+/// the ice while lightning occasionally cracks the curtains apart.
+fn scene_streams(f: &mut Frame, area: Rect, tick: u32) {
+    let ground_y = (area.y + area.height).saturating_sub(2);
+    let sky = ground_y.saturating_sub(area.y);
+    // Stars first — the curtains paint over them only where they glow.
+    for i in 0..40u32 {
+        let h = hash(i, 17);
+        let x = area.x + (h % area.width.max(1) as u32) as u16;
+        let y = area.y + ((((h >> 8) % sky.max(1) as u32) * 9) / 10) as u16;
+        if (tick / 5 + i) % (7 + h % 9) < 4 {
+            put(f, area, x, y, '✦', Style::default().fg(Color::Rgb(0xba, 0xc2, 0xfe)).add_modifier(Modifier::DIM));
+        }
+    }
+    paint_curtains(f, area, tick, sky, 1.0);
+    lightning(f, area, tick, ground_y, 83);
+    for x in 0..area.width {
+        let h = hash(x as u32, 99);
+        put(f, area, x, ground_y, if h % 7 == 0 { '▂' } else { '▁' }, Style::default().fg(Color::Rgb(0x3a, 0x40, 0x58)));
+    }
+    let base = ground_y.saturating_sub(CLASSIC.len() as u16);
+    let x = area.x as i32 + area.width.saturating_sub(11) as i32 / 2;
+    put_sprite(f, area, x, base, &idle_frame(tick), Style::default().fg(Color::Rgb(0xcd, 0xd6, 0xf4)).add_modifier(Modifier::BOLD));
+}
+
 /// Scene 2 — belly slide: one penguin surfs across, two cheer it on.
 fn scene_slide(f: &mut Frame, area: Rect, tick: u32) {
     aurora_sky(f, area, tick, 0.8);
@@ -534,7 +746,7 @@ fn dim_to(c: (u8, u8, u8), t: f64) -> Color {
     Color::Rgb(mix(0x10, c.0, t), mix(0x10, c.1, t), mix(0x14, c.2, t))
 }
 
-/// Effect 3 — matrix rain: streams of katakana fall down every column with a
+/// Effect — matrix rain: streams of katakana fall down every column with a
 /// burning white-green head, glyphs mutating as they drop, trails fading to
 /// dark; the wordmark blazes solid wherever a stream crosses it.
 fn fx_matrix_rain(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
@@ -566,6 +778,12 @@ fn fx_matrix_rain(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
             };
             let f_t = t as f64 / len as f64;
             let intensity = if t == 0 { 1.0 } else { (1.0 - f_t).powi(2) * 0.9 };
+            // Trail tips fade to nothing instead of freezing at minimum glow
+            // (the frame buffer is wiped every tick, so unpainted cells are
+            // genuinely empty — no leftovers when the entry rotates).
+            if t > 0 && intensity < 0.05 {
+                continue;
+            }
             let lx = col as i32 - w.ox as i32;
             let ly = yy as i32 - w.oy as i32;
             let on_mark = w.inside(lx, ly) && w.at(lx.max(0) as usize, ly.max(0) as usize);
@@ -581,7 +799,7 @@ fn fx_matrix_rain(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
     }
 }
 
-/// Effect 4 — scramble decode: the mark materializes out of TV static, one
+/// Effect — scramble decode: the mark materializes out of TV static, one
 /// pixel at a time in a left-to-right reveal wave with a bright scanline.
 fn fx_scramble(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
     const NOISE: [char; 14] = ['▒', '░', '~', '!', '<', '>', '^', '*', '+', '#', '%', '&', '■', '□'];
@@ -617,7 +835,7 @@ fn fx_scramble(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
     }
 }
 
-/// Effect 5 — glitch: solid mark with horizontal slice displacement and
+/// Effect — glitch: solid mark with horizontal slice displacement and
 /// red/blue chromatic-split tears on random rows.
 fn fx_glitch(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
     let frame = tick / 2;
@@ -645,30 +863,37 @@ fn fx_glitch(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
     }
 }
 
-/// Effect 6 — wave sway: the mark sways on a travelling sine; crests bleach
-/// toward white, troughs sink into dim blue.
+/// Effect — wave sway: the mark sways on a travelling sine; crests bleach
+/// toward white, troughs sink into dim blue. A white specular band (absorbed
+/// from the retired shimmer sweep) sweeps left→right across the waves.
 fn fx_wave(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
     let t = tick as f64 * 0.16;
+    let band = ((tick as f64 / 1.6) % (w.w as f64 + 10.0)) as i32 - 5;
     for x in 0..w.w as usize {
         let phase = (x as f64 * 0.32 + t).sin();
         let off = (phase * 2.0).round() as i32;
         let crest = (phase + 1.0) / 2.0; // 0..1
+        let in_band = ((x as i32 - band).abs()) < 2;
         for y in 0..w.h as usize {
             if !w.at(x, y) {
                 continue;
             }
             let edge = if y == 0 || y + 1 == w.h as usize || !w.at(x, y - 1) || !w.at(x, (y + 1).min(w.h as usize - 1)) { 1.0 } else { 0.72 };
-            let fg = Color::Rgb(
-                mix(0x89, 0xd8, crest * edge),
-                mix(0xb4, 0xf5, crest * edge),
-                mix(0xfa, 0xb2, crest * edge),
-            );
-            w.put_local(f, area, x as i32, y as i32 + off, '█', Style::default().fg(fg));
+            let fg = if in_band {
+                Color::Rgb(0xf5, 0xf8, 0xff)
+            } else {
+                Color::Rgb(
+                    mix(0x89, 0xd8, crest * edge),
+                    mix(0xb4, 0xf5, crest * edge),
+                    mix(0xfa, 0xb2, crest * edge),
+                )
+            };
+            w.put_local(f, area, x as i32, y as i32 + off, '█', Style::default().fg(fg).add_modifier(Modifier::BOLD));
         }
     }
 }
 
-/// Effect 7 — fire glow: flames lick down from the top of each pixel column;
+/// Effect — fire glow: flames lick down from the top of each pixel column;
 /// unlit pixels smoulder dark red so the mark never disappears.
 fn fx_fire(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
     for x in 0..w.w as usize {
@@ -693,32 +918,21 @@ fn fx_fire(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
     }
 }
 
-/// Effect 8 — shimmer sweep: diagonal pastel ramp across the mark plus a
-/// white specular band travelling left to right.
-fn fx_shimmer(f: &mut Frame, area: Rect, tick: u32, w: &Wordmark) {
-    let band = ((tick as f64 / 1.6) % (w.w as f64 + 10.0)) as i32 - 5;
-    w.for_each_pixel(|x, y| {
-        let in_band = ((x as i32 - band).abs()) < 2;
-        let fg = if in_band { Color::Rgb(0xf5, 0xf8, 0xff) } else { shimmer_color(tick / 2, x + y) };
-        w.put_local(f, area, x as i32, y as i32, '█', Style::default().fg(fg).add_modifier(Modifier::BOLD));
-    });
-}
-
 pub fn render_screensaver(entry: usize, tick: u32, f: &mut Frame, area: Rect) {
     let wordmark_effect = entry % ENTRY_COUNT >= SCENE_COUNT;
     match entry % ENTRY_COUNT {
         1 => scene_aurora(f, area, tick),
         2 => scene_slide(f, area, tick),
+        3 => scene_streams(f, area, tick),
         0 => scene_stroll(f, area, tick),
         e => {
             let w = Wordmark::layout(area);
             match e {
-                3 => fx_matrix_rain(f, area, tick, &w),
-                4 => fx_scramble(f, area, tick, &w),
-                5 => fx_glitch(f, area, tick, &w),
-                6 => fx_wave(f, area, tick, &w),
-                7 => fx_fire(f, area, tick, &w),
-                _ => fx_shimmer(f, area, tick, &w),
+                4 => fx_matrix_rain(f, area, tick, &w),
+                5 => fx_scramble(f, area, tick, &w),
+                6 => fx_glitch(f, area, tick, &w),
+                7 => fx_wave(f, area, tick, &w),
+                _ => fx_fire(f, area, tick, &w),
             }
         }
     }
@@ -866,6 +1080,40 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect();
         assert!(text.contains("o_o") || text.contains("-_-") || text.contains(">_<"), "no penguin face found in stroll scene");
+    }
+
+    #[test]
+    fn lightning_crawls_down_and_strokes_diagonally() {
+        let area = Rect::new(0, 0, 120, 34);
+        let ground_y: u16 = 32;
+        let frame = |tick: u32| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+            let _ = terminal.draw(|f| lightning(f, f.area(), tick, ground_y, 47));
+            terminal.backend().buffer().clone()
+        };
+        let bolt_rows = |buf: &ratatui::buffer::Buffer| -> Vec<u16> {
+            (0..34u16)
+                .filter(|&y| (0..120u16).any(|x| matches!(buf[(x, y)].symbol(), "│" | "╱" | "╲")))
+                .collect()
+        };
+        let mut saw_diag = false;
+        for s in 0..8u32 {
+            let base = s * 47 + 1; // first crawl frame of strike s+1
+            let b0 = frame(base);
+            let bf = frame(base + 3); // leader should be at/near the ground
+            let rows0 = bolt_rows(&b0);
+            let rows_full = bolt_rows(&bf);
+            assert!(!rows0.is_empty() && !rows_full.is_empty(), "strike {s} drew nothing");
+            // crawl: on frame 0 the bolt covers only the upper sky…
+            assert!(*rows0.iter().min().unwrap() < 8, "strike {s} did not start at the top");
+            assert!(*rows0.iter().max().unwrap() < ground_y / 2, "strike {s} appeared all at once");
+            // …and by frame 3 it has reached the ground.
+            assert!(*rows_full.iter().max().unwrap() >= ground_y - 3, "strike {s} never reached ground");
+            if (0..34u16).any(|y| (0..120u16).any(|x| matches!(bf[(x, y)].symbol(), "╱" | "╲"))) {
+                saw_diag = true; // jitter and forks draw diagonal strokes
+            }
+        }
+        assert!(saw_diag, "bolts are pure vertical lines — no jitter or forks");
     }
 
     #[test]
