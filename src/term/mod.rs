@@ -755,7 +755,6 @@ mod tests {
         let t = &emu.term;
         assert_eq!(line_text(&t.screen_lines()[0]), "red normal");
         assert!(matches!(t.screen_lines()[0][0].fg, TColor::Idx(1)));
-        drop(t);
         emu.feed(b"\x1b[H\x1b[2J");
         assert_eq!(line_text(&emu.term.screen_lines()[0]), "");
     }

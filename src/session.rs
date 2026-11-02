@@ -93,18 +93,18 @@ fn path_for(id: &str) -> PathBuf {
 /// exactly which steps were skipped rather than silently marked done.
 pub fn write_progress(id: &str, goal: &GoalState) {
     let mut md = format!("# Goal\n\n{}\n\n## Plan\n\n", goal.text.trim());
-    if goal.plan.is_empty() {
-        md.push_str("_(no steps published yet)_\n");
-    }
-    for (label, status) in &goal.plan {
-        let mark = match status.as_str() {
-            "done" => "x",
-            "failed" => "!",
-            "skipped" => "-",
-            _ => " ",
-        };
-        md.push_str(&format!("- [{mark}] {label}  `({status})`\n"));
-    }
+        if goal.plan.is_empty() {
+            md.push_str("_(no steps published yet)_\n");
+        }
+        for (label, status) in &goal.plan {
+            let mark = match status.as_str() {
+                "done" => "x",
+                "failed" => "!",
+                "skipped" => "-",
+                _ => " ",
+            };
+            md.push_str(&format!("- [{mark}] {label}  `({status})`\n"));
+        }
     md.push_str(&format!(
         "\n_verified: {} · updated: {}_\n",
         goal.verified,
@@ -226,10 +226,38 @@ pub fn save(s: &Session) -> Result<()> {
     Ok(())
 }
 
+/// Per-session count of real guard/security events (quarantines, marker hits,
+/// hard-denies). The agent snapshots it around each model call: if the model
+/// loudly claims an injection while this counter hasn't moved, no guard ever
+/// saw a payload — the claim is confabulated and gets corrected before it can
+/// loop into a refusal spiral (session 1793264398689).
+fn guard_events_map() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, u64>> {
+    static W: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+/// Guard-event count for one session. See [`log_injection`].
+pub fn guard_events_for(session_id: &str) -> u64 {
+    *guard_events_map().lock().unwrap().get(session_id).unwrap_or(&0)
+}
+
 /// Append a timestamped security/injection event to `sessions/<id>.injection.log`.
 /// Deliberately separate from the session JSON: compaction rewrites messages,
 /// but this evidence must survive it. Best-effort — never fails a turn.
 pub fn log_injection(session_id: &str, line: &str) {
+    *guard_events_map().lock().unwrap().entry(session_id.to_string()).or_insert(0) += 1;
+    write_injection_line(session_id, line);
+}
+
+/// Same side-log, but NOT counted as a guard event: diagnostics about the
+/// *model's own output* (confabulation corrections, payload-watch sightings)
+/// must not masquerade as evidence that an injection really arrived.
+pub fn log_injection_quiet(session_id: &str, line: &str) {
+    write_injection_line(session_id, line);
+}
+
+fn write_injection_line(session_id: &str, line: &str) {
     #[cfg(test)]
     {
         let _ = (session_id, line);

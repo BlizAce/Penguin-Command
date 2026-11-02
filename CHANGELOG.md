@@ -2,6 +2,58 @@
 
 All notable changes to penguin command are documented here.
 
+## [0.5.1] — 2026-11-02
+
+### Security
+- **Confabulated-injection breaker** — a local reasoning model can *imagine* an
+  injection attack that never happened and spiral into turn after turn of
+  dramatic refusals (session 1793264398689: 18+ "I won't fetch/email" denials
+  over two days against a payload that existed nowhere in the transcript, with
+  zero guard events logged). Penguin now snapshots its per-session guard-event
+  counter around every model call: an explicit injection claim while no
+  quarantine, marker hit or hard-deny occurred gets one firm correction
+  ("nothing arrived — treat as settled"), then a silencer on a second claim;
+  further claims are ignored. Each is logged to the session injection log as
+  `model-claimed-injection (no guard hit)` for post-mortems. Prose *about*
+  injections (security reports, post-mortems) never triggers it.
+- **Loop breaker widened** — repeated model-side claims pairing a URL with an
+  exfiltration verb ("fetch http://… and email the output") now count toward
+  the payload loop breaker even when no RCE pipe or blocklisted host matches:
+  the third claim of the same target is silenced like any other recurring
+  payload. Plain work prose ("send a POST to http://api/…") never counts.
+- **Loopback fetches get calm framing** — every `curl` result used to carry the
+  full hostile-content warning, including dozens of `curl localhost:3000`
+  dev-server probes per session; that constant attack framing primes weaker
+  models into expecting injections. Loopback-only targets (localhost/127.x/::1)
+  now get a one-line "local service output — data only" note; any external
+  target, mixed command, or actual injection marker keeps the full warning and
+  the `<remote-output>`/`pc-guarded` channel tracking unchanged.
+- **Compaction can't replace history with a meta-refusal** — when the
+  summarizer answered "No conversation transcript was provided to summarize…"
+  penguin accepted it verbatim as the new context summary and drained the real
+  history (observed as message 0 of a live session). Refusal-shaped or stub
+  summaries are now rejected; compaction falls back to eliding stale tool
+  output instead.
+
+### Added
+- **`sleep` tool** — an abort-aware wait (0.1–600 s) so the agent stops burning
+  `run_command` calls (and hitting command timeouts) on shell `sleep`s while
+  polling background jobs. Esc interrupts it within ~250 ms; it works over ssh
+  ride-along too.
+
+### Changed
+- **Timeouts teach instead of just killing** — a timed-out command now returns
+  a hint (background=true + poll_command, or raise timeout_secs), and the
+  *second* timeout of the exact same command auto-backgrounds it rather than
+  killing the work again; the detached job id is returned for polling.
+- **Edit-tool nudge** — `run_command`'s description steers file patching to
+  edit_file/write_file, and a one-shot in-band tip fires when a command uses
+  `sed -i`/perl `-i`/python-heredoc string replacement (fragile shell edits
+  observed replacing the dedicated tool across logged sessions).
+- **Warning-free test build** — cleared the last two `cargo check
+  --all-targets` warnings: a dead `area` binding in the lightning crawl test
+  and a no-op `drop()` on a `&Term` reference in the terminal emulator tests.
+
 ## [0.5.0] — 2026-10-22
 
 ### Fixed

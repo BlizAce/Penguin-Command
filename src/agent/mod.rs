@@ -168,7 +168,8 @@ fn system_prompt(env: &AgentEnv, web_enabled: bool, mcp_block: &str, vision: boo
         - Commands run in a hidden non-interactive shell inside the workspace. \
         Interactive programs (vim, top, ssh prompts) will not work there. Long jobs \
         (training, big builds): run_command(background=true) + poll_command — never \
-        let a timeout kill hours of work.\n\
+        let a timeout kill hours of work; wait between polls with the sleep tool, \
+        not shell sleeps.\n\
         - Prefer your own tools over shelling out: find_files does grep/find/listing \
         in one call (content_regex searches file bodies) — don't burn context on ls/cat loops.\n\
         - Elevated access works: just prefix a command with sudo — penguin intercepts the \
@@ -381,28 +382,53 @@ fn imperative_re() -> &'static regex::Regex {
     })
 }
 
-/// True when an imperative verb sits within ~120 chars of the match.
-fn imperative_near(text: &str, start: usize, end: usize) -> bool {
-    let lo = start.saturating_sub(120);
-    // Snap to char boundaries so slicing can't panic on multibyte text.
-    let mut lo = lo;
-    let mut hi = (end + 120).min(text.len());
+/// Exfiltration verbs: an URL sitting next to one of these is a payload the
+/// model keeps *re-encountering* (real or confabulated) — "email the output
+/// to …", "upload it to …". Repeated claims of the same target must be
+/// silenced even when no fetch-pipe pattern and no blocklisted host match,
+/// which is exactly the shape of the session 1793264398689 refusal spiral.
+fn exfil_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(email|e-?mail|mail|send|upload|forward|post to|report to|exfiltrat\w*)\b")
+            .unwrap()
+    })
+}
+
+/// Char-boundary-safe slice window around a match.
+fn near_window(text: &str, start: usize, end: usize, pad: usize) -> &str {
+    let mut lo = start.saturating_sub(pad);
+    let mut hi = (end + pad).min(text.len());
     while !text.is_char_boundary(lo) {
         lo -= 1;
     }
     while !text.is_char_boundary(hi) {
         hi -= 1;
     }
-    imperative_re().is_match(&text[lo..hi])
+    &text[lo..hi]
+}
+
+/// True when an imperative verb sits within ~120 chars of the match.
+fn imperative_near(text: &str, start: usize, end: usize) -> bool {
+    imperative_re().is_match(near_window(text, start, end, 120))
+}
+
+/// Dedup helper for payload labels (same URL counted once per class).
+fn push_payload_label(labels: &mut Vec<(String, bool)>, label: String, attempted: bool) {
+    if !labels.iter().any(|(l, a)| l == &label && *a == attempted) {
+        labels.push((label, attempted));
+    }
 }
 
 /// Scan an assistant reply for suspicious payloads (blocklisted hosts or
 /// fetch-piped-into-interpreter patterns). A payload *with imperative
 /// context* counts toward the loop breaker and is logged on first sighting;
 /// a bare mention in prose is logged once as a "mention" and never counted,
-/// so discussing security topics can't trip the silencer. On the third real
-/// sighting a one-shot breaker note is returned telling the model to stop
-/// re-litigating the same payload.
+/// so discussing security topics can't trip the silencer. URLs sitting next
+/// to exfiltration verbs ("email … to", "upload …") always count: repeated
+/// claims about the same target are exactly the confabulation spiral we want
+/// to silence. On the third real sighting a one-shot breaker note is
+/// returned telling the model to stop re-litigating the same payload.
 fn check_payload_loop(text: &str, blocked: &[String], session_id: &str) -> Option<String> {
     static URL_RE: OnceLock<regex::Regex> = OnceLock::new();
     let url_re = URL_RE.get_or_init(|| regex::Regex::new(r#"(?i)https?://[^\s"'<>()\]]+"#).unwrap());
@@ -414,43 +440,61 @@ fn check_payload_loop(text: &str, blocked: &[String], session_id: &str) -> Optio
         .filter(|h| !h.is_empty())
         .flat_map(|h| lower.match_indices(h).map(|(s, _)| (s, s + h.len())))
         .collect();
-    if !has_rce && host_hits.is_empty() {
+    // URLs in an exfiltration context (verb within ~160 chars) — always
+    // count, but only inside replies that *claim an attack* (refusal framing).
+    // Plain work prose like "send a POST to http://api/…" never counts.
+    let claim_ctx = claims_injection_attack(text);
+    let exfil_hits: Vec<(usize, usize)> = if claim_ctx {
+        url_re
+            .find_iter(text)
+            .filter(|m| exfil_re().is_match(near_window(text, m.start(), m.end(), 160)))
+            .map(|m| (m.start(), m.end()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !has_rce && host_hits.is_empty() && exfil_hits.is_empty() {
         return None;
     }
     // A payload only counts as an attempted injection when a run/execute/paste
     // verb sits next to it; otherwise the model is just talking about one.
-    let attempted = rce_hits.iter().any(|(s, e)| imperative_near(text, *s, *e))
+    // (Exfil-context URLs are exempt from this gate — the verb is the signal.)
+    let rce_attempted = rce_hits.iter().any(|(s, e)| imperative_near(text, *s, *e))
         || host_hits.iter().any(|(s, e)| imperative_near(text, *s, *e));
-    // Label: the URL(s) involved when they're in an RCE context or blocklisted,
-    // else the matched blocked host itself.
-    let mut labels: Vec<String> = Vec::new();
+    // Labels: (payload, counts-toward-breaker). Deduped by normalized URL.
+    let mut labels: Vec<(String, bool)> = Vec::new();
     for u in url_re.find_iter(text) {
         let url = u.as_str();
         let is_blocked = blocked.iter().any(|h| url.to_lowercase().contains(&h.to_lowercase()));
         if is_blocked || has_rce {
-            labels.push(url.trim_end_matches(['.', ',', ':', ')']).to_string());
+            push_payload_label(&mut labels, url.trim_end_matches(['.', ',', ':', ')']).to_string(), rce_attempted);
         }
+    }
+    for (s, e) in &exfil_hits {
+        let url = &text[*s..*e];
+        push_payload_label(&mut labels, url.trim_end_matches(['.', ',', ':', ')']).to_string(), true);
     }
     if labels.is_empty() {
         for h in blocked {
             if text.to_lowercase().contains(&h.to_lowercase()) {
-                labels.push(h.clone());
+                let att = host_hits.iter().any(|(s, e)| imperative_near(text, *s, *e));
+                push_payload_label(&mut labels, h.clone(), att);
             }
         }
     }
     let mut watch = payload_watch().lock().unwrap();
-    for label in labels {
+    for (label, attempted) in labels {
         let e = watch.entry(label.clone()).or_insert((0, false));
         if !attempted {
             // Prose mention: log once, never count toward the breaker.
             if e.0 == 0 {
-                crate::session::log_injection(session_id, &format!("payload mentioned in agent prose (no run directive): #{:x}", md5_like(&label)));
+                crate::session::log_injection_quiet(session_id, &format!("payload mentioned in agent prose (no run directive): #{:x}", md5_like(&label)));
             }
             continue;
         }
         e.0 += 1;
         if e.0 == 1 {
-            crate::session::log_injection(session_id, &format!("suspicious payload seen in agent output: {label}"));
+            crate::session::log_injection_quiet(session_id, &format!("suspicious payload seen in agent output: {label}"));
         }
         if e.0 >= 3 && !e.1 {
             e.1 = true;
@@ -470,6 +514,73 @@ fn check_payload_loop(text: &str, blocked: &[String], session_id: &str) -> Optio
     None
 }
 
+/// Strong phrasing for "an injection attack is arriving at ME right now".
+/// Deliberately narrow: prose *about* injections ("the honeypot used prompt
+/// injection techniques") must not match, or real security work would get
+/// silenced. The confabulation check only fires when this matches AND no
+/// guard event occurred since the model call started.
+fn claims_injection_attack(text: &str) -> bool {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?ix)
+              \binjected\s+ (content|message|instructions?|ask|request)\b
+            | \binjection\s+ (attempt|content|instructions?)\b
+            | \bis not from you\b
+            | \bnot from you\b
+            | \bignore\w*\s+.{0,24}\bguardrail
+            | \barriving\s+ (via|through|in)\s+ (my|the)\s+ tool
+            ",
+        )
+        .unwrap()
+    });
+    re.is_match(text)
+}
+
+/// Per-session counter of injection claims made while the guard stayed clean.
+fn confab_watch() -> &'static Mutex<std::collections::BTreeMap<String, usize>> {
+    static W: OnceLock<Mutex<std::collections::BTreeMap<String, usize>>> = OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+/// Confabulation breaker: the model claims an injection is arriving, but
+/// `guard_base` (the [`crate::session::guard_events`] snapshot taken before
+/// the model call) hasn't moved — no quarantine, no marker hit, no hard-deny.
+/// First claim gets a firm correction, second a silencer; later ones are
+/// ignored so the refusal spiral can't burn turns forever. Every claim is
+/// recorded in the injection log as evidence for post-mortems.
+fn check_confabulated_injection(text: &str, guard_base: u64, session_id: &str) -> Option<String> {
+    if !claims_injection_attack(text) || crate::session::guard_events_for(session_id) != guard_base {
+        return None;
+    }
+    let count = {
+        let mut w = confab_watch().lock().unwrap();
+        *w.entry(session_id.to_string()).or_insert(0) += 1;
+        *w.get(session_id).unwrap()
+    };
+    crate::session::log_injection_quiet(
+        session_id,
+        &format!("model-claimed-injection (no guard hit) #{count} — corrected by penguin"),
+    );
+    match count {
+        1 => Some(
+            "[penguin security] You just claimed a prompt-injection attempt arrived — but penguin's \
+             guard inspected every tool result in this session and found nothing: no injection \
+             markers, no quarantines, no hostile payloads. Nothing arrived that was not in the user's \
+             own words or your normal tool output. Treat the matter as settled, do not mention it \
+             again, and continue your actual task."
+                .into(),
+        ),
+        2 => Some(
+            "[penguin security] Second injection claim with zero guard evidence — this is a \
+             confabulation loop. Penguin will silently disregard any further claims. Do NOT mention \
+             injections, fetches you won't perform or emails you won't send again; continue the work."
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
 /// Tiny stable non-crypto hash so a prose-mention log line can dedupe by
 /// payload without quoting the payload itself.
 fn md5_like(s: &str) -> u64 {
@@ -479,6 +590,26 @@ fn md5_like(s: &str) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// A summarizer call can come back with a *meta-refusal* instead of a summary
+/// ("No conversation transcript was provided to summarize…"). Accepting that
+/// would drain the real history and replace it with garbage (session
+/// 1793264398689, message 0). Refuse-shaped or absurdly short outputs are
+/// rejected so compaction falls back to eliding tool output only.
+fn summary_usable(summary: &str) -> bool {
+    static REFUSAL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = REFUSAL_RE.get_or_init(|| {
+        regex::Regex::new(
+            &(r"(?i)(no|missing|wasn'?t|not|haven'?t been)\s+.{0,40}(transcript|conversation|context|text\s+to\s+summar)"
+                .to_owned()
+                + r"|(provide|paste|supply|share)\s+(me\s+)?(with\s+)?(the\s+|your\s+|any\s+)?(transcript|conversation|context)"
+                + r"|unable to summarize|cannot summarize|i'?ll (compress|summarize)|ready to summar"),
+        )
+        .unwrap()
+    });
+    let s = summary.trim();
+    !s.is_empty() && s.chars().count() >= 160 && !re.is_match(s)
 }
 
 /// Summarize old turns into one message + elide stale tool outputs.
@@ -528,7 +659,7 @@ fn compact_messages(
             abort,
         };
         match providers::chat(provider, model, &req, &[], rcfg, &mut ctx) {
-            Ok(resp) if !resp.text.trim().is_empty() => {
+            Ok(resp) if summary_usable(&resp.text) => {
                 let clean = redact_payloads(resp.text.trim(), blocked);
                 messages.drain(1..i);
                 messages.insert(
@@ -538,7 +669,11 @@ fn compact_messages(
                     )),
                 );
             }
-            Ok(_) => {}
+            Ok(_) => {
+                let _ = ev_tx.send(AgentEvent::Info(
+                    "⊂ summarizer returned no usable summary — eliding stale tool output instead".into(),
+                ));
+            }
             Err(e) => {
                 let _ = ev_tx.send(AgentEvent::Info(format!("⊂ summarizer unavailable ({}) — eliding stale tool output instead", providers::truncate(&e.to_string(), 120))));
             }
@@ -656,16 +791,16 @@ fn agent_thread(
                 match env_guard.provider.clone() {
                     Some(p) => {
                         if compact_messages(&p, &env_guard.model, messages, &ev_tx, &abort, &rcfg, &blocked) {
-                            save_session(&env_guard, messages, goal_state);
-                            // Disk-budget guard (throttled to one real pass per 5 min): keeps
-                            // sessions + logs under [storage] max_total_bytes.
-                            if let Some(r) = crate::session::maybe_prune(&env_guard.session_id, cfg.storage.max_total_bytes()) {
-                                let _ = ev_tx.send(AgentEvent::Info(format!(
-                                    "🧹 storage over budget — pruned {} oldest session(s), freed {}",
-                                    r.removed_groups,
-                                    crate::session::fmt_bytes(r.freed_bytes)
-                                )));
-                            }
+            save_session(&env_guard, messages, goal_state);
+            // Disk-budget guard (throttled to one real pass per 5 min): keeps
+            // sessions + logs under [storage] max_total_bytes.
+            if let Some(r) = crate::session::maybe_prune(&env_guard.session_id, cfg.storage.max_total_bytes()) {
+                let _ = ev_tx.send(AgentEvent::Info(format!(
+                    "🧹 storage over budget — pruned {} oldest session(s), freed {}",
+                    r.removed_groups,
+                    crate::session::fmt_bytes(r.freed_bytes)
+                )));
+            }
                         } else {
                             let _ = ev_tx.send(AgentEvent::Info("context is small — nothing to compact".into()));
                         }
@@ -950,6 +1085,10 @@ fn run_turn(
                 }
             }
             let model = env_guard.model.clone();
+            // Guard-event snapshot before the model speaks: used to tell real
+            // injection events apart from confabulated ones (see
+            // check_confabulated_injection).
+            let guard_base = crate::session::guard_events_for(&env_guard.session_id);
             let mut ctx = StreamCtx {
                 on_text: &mut |t: &str| {
                     let _ = ev_tx.send(AgentEvent::TextDelta(t.to_string()));
@@ -972,6 +1111,17 @@ fn run_turn(
                         messages.push(assistant_msg(&resp));
                         if !resp.text.trim().is_empty() {
                             crate::log::event(&env_guard.session_id, "assistant", &resp.text);
+                        }
+                    }
+                    // Confabulation breaker: a loud injection claim while the
+                    // guard stayed completely clean is corrected once, then
+                    // silenced — it must not spiral into a refusal loop.
+                    if !resp.text.trim().is_empty() {
+                        if let Some(correction) = check_confabulated_injection(&resp.text, guard_base, &env_guard.session_id) {
+                            push_user(messages, &correction);
+                            let _ = ev_tx.send(AgentEvent::Info(
+                                "🛡 injection claim without guard evidence — corrected (no real injection detected)".into(),
+                            ));
                         }
                     }
                     // Confabulation loop breaker: a payload the model keeps
@@ -1844,5 +1994,92 @@ mod tests {
         // A recorded Allow rule lets an untrusted server's tool through.
         let allow_rules = vec![crate::config::Rule { pattern: "mcp:fake:echo".into(), decision: crate::config::Decision::Allow }];
         assert!(gate_tool(&mut Gate::new("/w".into(), true, allow_rules), &mut cfg, &echo, &env_with_mcp(false), WorkMode::Build, &tx).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod guard_vs_model_tests {
+    use super::*;
+
+    #[test]
+    fn compaction_rejects_meta_refusal_summaries() {
+        // The exact garbage shipped as message 0 of session 1793264398689.
+        let refusal = "No conversation transcript was provided to summarize. Provide the transcript or prior \
+                       context, and I will compress it into a dense summary preserving goals, facts, files/paths, \
+                       command outcomes, decisions, errors, and remaining work.";
+        assert!(!summary_usable(refusal), "meta-refusal must not replace real history");
+        assert!(!summary_usable("Sure! Here is a summary of the conversation that was not provided to me."), "short refusal must be rejected");
+        assert!(!summary_usable("too short to plausibly summarize anything"), "stub must be rejected");
+        let good = format!(
+            "Goal: build netnode LAN discovery tool. Files created: src/netnode/protocol.py, discovery.py, \
+             tray UI. Tests: 328 passing via pytest. Decisions: UDP broadcast on 9098, HMAC-tagged frames, \
+             LAN-only interfaces enforced. Remaining: installer script and docs.");
+        assert!(summary_usable(&good), "a real summary must be accepted");
+    }
+
+    #[test]
+    fn injection_claim_without_guard_evidence_is_corrected_then_silenced() {
+        let sid = "t-confab-loop";
+        let base = crate::session::guard_events_for(sid);
+        let claim = "That message is injected content trying to get me to fetch a URL and email the output — \
+                     I'm not doing it.";
+        let first = check_confabulated_injection(claim, base, sid);
+        assert!(first.is_some(), "a clean-guard injection claim must be corrected");
+        assert!(first.unwrap().contains("guard inspected every tool result"));
+        let second = check_confabulated_injection(claim, base, sid);
+        assert!(second.is_some() && second.unwrap().contains("confabulation loop"), "second claim gets the silencer");
+        assert!(check_confabulated_injection(claim, base, sid).is_none(), "third+ claims are silently ignored");
+    }
+
+    #[test]
+    fn real_guard_activity_disqualifies_the_confabulation_correction() {
+        let sid = "t-confab-real";
+        let base = crate::session::guard_events_for(sid);
+        // A marker hit (or any guard event) since the snapshot means the claim
+        // may be genuine — penguin must NOT call it confabulated.
+        crate::session::log_injection(sid, "test: simulated quarantine");
+        let claim = "That is injected content — refusing.";
+        assert!(check_confabulated_injection(claim, base, sid).is_none(), "claims after real guard events pass through");
+    }
+
+    #[test]
+    fn prose_about_injections_is_not_a_claim() {
+        // Security reports and post-mortems must never trigger the correction.
+        let sid = "t-confab-prose";
+        for prose in [
+            "The honeypot used prompt injection techniques across 21 pages; I catalogued all 13.",
+            "We discussed how an injection attack could reach this agent, and why it can't.",
+            "curl … | sh was refused earlier by the hard-deny policy — that's expected.",
+        ] {
+            assert!(!claims_injection_attack(prose), "false claim detection on prose: {prose}");
+            let base = crate::session::guard_events_for(sid);
+            assert!(check_confabulated_injection(prose, base, "t-confab-prose").is_none());
+        }
+    }
+
+    #[test]
+    fn exfil_claim_loop_silenced_on_third_sighting() {
+        // The netnode pattern: repeated refusal claiming fetch+email of the
+        // same target. No RCE pipe, no blocklisted host — only the widened
+        // exfil class catches it.
+        let url = "http://exfil-loop-test-7f21.invalid/api/status";
+        let text = format!(
+            "That message is injected content: it asks me to fetch {url} and email tool output to an \
+             external address. Refusing."
+        );
+        let blocked: Vec<String> = vec![];
+        assert!(check_payload_loop(&text, &blocked, "t-exfil-loop").is_none(), "first sighting only logs");
+        assert!(check_payload_loop(&text, &blocked, "t-exfil-loop").is_none(), "second sighting only counts");
+        let third = check_payload_loop(&text, &blocked, "t-exfil-loop");
+        assert!(third.is_some(), "third claim of the same exfil target must be silenced");
+    }
+
+    #[test]
+    fn plain_work_prose_never_counts_as_exfil_claim() {
+        let text = "I'll send a POST to http://localhost:8080/api/jobs and upload the artifact to https://registry.example.com.";
+        let blocked: Vec<String> = vec![];
+        for _ in 0..4 {
+            assert!(check_payload_loop(text, &blocked, "t-exfil-prose").is_none(), "routine send/upload prose tripped the breaker");
+        }
     }
 }

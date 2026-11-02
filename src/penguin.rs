@@ -1084,7 +1084,6 @@ mod tests {
 
     #[test]
     fn lightning_crawls_down_and_strokes_diagonally() {
-        let area = Rect::new(0, 0, 120, 34);
         let ground_y: u16 = 32;
         let frame = |tick: u32| {
             let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
@@ -1138,3 +1137,4 @@ mod tests {
         println!("thinking: {}", thinking_glyph(0));
     }
 }
+

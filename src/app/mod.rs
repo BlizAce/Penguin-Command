@@ -1428,8 +1428,8 @@ pub fn run(opts: Options) -> Result<()> {
         recv_chars: 0,
         activity: None,
         turn_tools: 0,
-        last_prompt: None,
-        go_ahead_rx: None,
+            last_prompt: None,
+            go_ahead_rx: None,
         queued: queue,
         expand_tools: false,
     };
